@@ -3,6 +3,7 @@ package batcher_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -351,5 +352,136 @@ func TestObserverPanicOnEveryEventIsRecovered(t *testing.T) {
 	}
 	if err := b.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// 约束（Round1-Q7 口径）：WaitSeconds 是组批耗时——size 触发时远小于
+// interval，interval 触发时不小于 interval。
+func TestFlushEventWaitSecondsSemantics(t *testing.T) {
+	t.Run("size-trigger-below-interval", func(t *testing.T) {
+		obs := &recordingObserver{}
+		b := batcher.New[int, int](identityFn,
+			batcher.WithMaxSize(2),
+			batcher.WithInterval(10*time.Second), // size 独占触发
+			batcher.WithObserver(obs),
+		)
+		var wg sync.WaitGroup
+		for i := 1; i <= 2; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				if _, err := b.Do(context.Background(), i); err != nil {
+					t.Errorf("Do(%d): %v", i, err)
+				}
+			}(i)
+		}
+		wg.Wait()
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		if len(obs.flushed) != 1 || obs.flushed[0].WaitSeconds >= 10.0 {
+			t.Fatalf("flushed = %+v, want WaitSeconds < interval（size 触发）", obs.flushed)
+		}
+	})
+
+	t.Run("interval-trigger-at-least-interval", func(t *testing.T) {
+		obs := &recordingObserver{}
+		const interval = 150 * time.Millisecond
+		b := batcher.New[int, int](identityFn,
+			batcher.WithMaxSize(100), // interval 独占触发
+			batcher.WithInterval(interval),
+			batcher.WithObserver(obs),
+		)
+		go func() { _, _ = b.Do(context.Background(), 1) }()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			obs.mu.Lock()
+			n := len(obs.flushed)
+			obs.mu.Unlock()
+			if n == 1 || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		if len(obs.flushed) != 1 {
+			t.Fatalf("flushed events = %d, want 1", len(obs.flushed))
+		}
+		if w := obs.flushed[0].WaitSeconds; w < interval.Seconds()*0.8 {
+			t.Fatalf("WaitSeconds = %v, want >= ~interval（interval 触发）", w)
+		}
+	})
+}
+
+// seqObserver 按到达顺序记录事件种类。
+type seqObserver struct {
+	mu  sync.Mutex
+	seq []string
+}
+
+func (o *seqObserver) OnCreated(batcher.CreatedEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.seq = append(o.seq, "created")
+}
+
+func (o *seqObserver) OnBatchFlushed(batcher.BatchFlushedEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.seq = append(o.seq, "flushed")
+}
+
+func (o *seqObserver) OnClosed(batcher.ClosedEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.seq = append(o.seq, "closed")
+}
+
+// 约束：事件全序为 Created → Flushed* → Closed，
+// 且并发 Close 下 OnClosed 恰好一次。
+func TestEventOrderingAndOnClosedExactlyOnce(t *testing.T) {
+	obs := &seqObserver{}
+	b := batcher.New[int, int](identityFn,
+		batcher.WithMaxSize(2),
+		batcher.WithInterval(50*time.Millisecond),
+		batcher.WithObserver(obs),
+	)
+	var wg sync.WaitGroup
+	for i := 1; i <= 4; i++ { // 两批
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := b.Do(context.Background(), i); err != nil {
+				t.Errorf("Do(%d): %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	var closeWg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		closeWg.Add(1)
+		go func() {
+			defer closeWg.Done()
+			if err := b.Close(context.Background()); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+	}
+	closeWg.Wait()
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	want := "[created flushed flushed closed]"
+	if got := fmt.Sprint(obs.seq); got != want {
+		t.Fatalf("event sequence = %s, want %s", got, want)
 	}
 }

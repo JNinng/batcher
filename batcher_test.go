@@ -561,7 +561,7 @@ func TestSlowBatchDoesNotCompensateTimerByArrival(t *testing.T) {
 
 	go func() { _, _ = b.Do(context.Background(), 3) }() // 慢执行期间停泊
 
-	<-entered // 第二批已触发
+	<-entered                         // 第二批已触发
 	time.Sleep(50 * time.Millisecond) // 等第二批 callEnd 记录
 	mu.Lock()
 	defer mu.Unlock()
