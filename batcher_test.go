@@ -1,0 +1,576 @@
+package batcher_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jninng/batcher"
+)
+
+// sizeResult 收集每个 Waiter 的对位结果。
+type sizeResult struct {
+	req int
+	res string
+	err error
+}
+
+func TestSizeTriggerFlushesOneBatchWithPositionalResults(t *testing.T) {
+	var mu sync.Mutex
+	var calls [][]int
+	fn := func(ctx context.Context, reqs []int) ([]string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, append([]int(nil), reqs...))
+		res := make([]string, len(reqs))
+		for i, r := range reqs {
+			res[i] = fmt.Sprintf("r%d", r)
+		}
+		return res, nil
+	}
+
+	b := batcher.New[int, string](fn,
+		batcher.WithMaxSize(3),
+		batcher.WithInterval(10*time.Second), // 测试期内绝不触发，隔离 size 条件
+	)
+	defer func() {
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}()
+
+	const n = 3
+	ch := make(chan sizeResult, n)
+	var wg sync.WaitGroup
+	for i := 1; i <= n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res, err := b.Do(context.Background(), i)
+			ch <- sizeResult{req: i, res: res, err: err}
+		}(i)
+	}
+	wg.Wait()
+	close(ch)
+
+	for r := range ch {
+		if r.err != nil {
+			t.Fatalf("Do(%d) error: %v", r.req, r.err)
+		}
+		// 按位置对位：每个 Waiter 拿到自己那条 req 的结果。
+		if want := fmt.Sprintf("r%d", r.req); r.res != want {
+			t.Fatalf("Do(%d) = %q, want %q", r.req, r.res, want)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("fn calls = %d, want 1", len(calls))
+	}
+	got := append([]int(nil), calls[0]...)
+	sort.Ints(got)
+	if fmt.Sprint(got) != "[1 2 3]" {
+		t.Fatalf("batch = %v, want [1 2 3]", got)
+	}
+}
+
+func TestIntervalTriggerFlushesPartialBatch(t *testing.T) {
+	var mu sync.Mutex
+	var calls [][]int
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, append([]int(nil), reqs...))
+		res := append([]int(nil), reqs...)
+		return res, nil
+	}
+
+	const interval = 150 * time.Millisecond
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(100), // 测试期内绝不触发，隔离 interval 条件
+		batcher.WithInterval(interval),
+	)
+	defer func() {
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}()
+
+	started := time.Now()
+	var wg sync.WaitGroup
+	for i := 1; i <= 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res, err := b.Do(context.Background(), i)
+			if err != nil {
+				t.Errorf("Do(%d) error: %v", i, err)
+			}
+			if res != i {
+				t.Errorf("Do(%d) = %d, want %d", i, res, i)
+			}
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(started)
+
+	// interval 是唯一触发条件：必须等满，且未久等。
+	if elapsed < interval {
+		t.Fatalf("flushed early: elapsed %v < interval %v", elapsed, interval)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("flushed late: elapsed %v", elapsed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("fn calls = %d, want 1", len(calls))
+	}
+	got := append([]int(nil), calls[0]...)
+	sort.Ints(got)
+	if fmt.Sprint(got) != "[1 2]" {
+		t.Fatalf("batch = %v, want [1 2]", got)
+	}
+}
+
+func TestIdleNeverCallsBatchFunction(t *testing.T) {
+	var calls atomic.Int64
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		calls.Add(1)
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(5*time.Millisecond),
+	)
+	defer func() {
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}()
+
+	// 空转远超若干个 interval 周期。
+	time.Sleep(100 * time.Millisecond)
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("fn calls while idle = %d, want 0", n)
+	}
+
+	// 有数据才触发。
+	if _, err := b.Do(context.Background(), 42); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("fn calls after one Do = %d, want 1", n)
+	}
+}
+
+func TestBatchErrorBroadcastToAllWaiters(t *testing.T) {
+	boom := errors.New("downstream down")
+	fn := func(ctx context.Context, reqs []int) ([]string, error) {
+		return nil, boom
+	}
+
+	b := batcher.New[int, string](fn,
+		batcher.WithMaxSize(3),
+		batcher.WithInterval(20*time.Millisecond),
+	)
+	defer func() {
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}()
+
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			res, err := b.Do(context.Background(), i)
+			if res != "" {
+				t.Errorf("res = %q, want zero value", res)
+			}
+			errs <- err
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; !errors.Is(err, boom) {
+			t.Fatalf("waiter error = %v, want boom (errors.Is)", err)
+		}
+	}
+}
+
+func TestLengthMismatchIsBatchError(t *testing.T) {
+	fn := func(ctx context.Context, reqs []int) ([]string, error) {
+		return []string{"only-one"}, nil // 无论入参多长都只回一条
+	}
+
+	b := batcher.New[int, string](fn,
+		batcher.WithMaxSize(4),
+		batcher.WithInterval(20*time.Millisecond),
+	)
+	defer func() {
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}()
+
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			_, err := b.Do(context.Background(), i)
+			errs <- err
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		err := <-errs
+		if err == nil || !strings.Contains(err.Error(), "returned 1 results for 2 requests") {
+			t.Fatalf("waiter error = %v, want length mismatch error", err)
+		}
+	}
+}
+
+func TestBatchFunctionPanicDegradesAndBatcherStaysUsable(t *testing.T) {
+	var call atomic.Int64
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		if call.Add(1) == 1 {
+			panic("first call explodes")
+		}
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(20*time.Millisecond),
+	)
+	defer func() {
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}()
+
+	_, err := b.Do(context.Background(), 1)
+	if err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("panic-degraded error = %v, want contains %q", err, "panicked")
+	}
+
+	// panic 不得拖垮库：后续 Do 正常。
+	if res, err := b.Do(context.Background(), 7); err != nil || res != 7 {
+		t.Fatalf("Do after panic = (%v, %v), want (7, nil)", res, err)
+	}
+}
+
+func TestCloseFlushesPendingItems(t *testing.T) {
+	var mu sync.Mutex
+	var calls [][]int
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, append([]int(nil), reqs...))
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(10),
+		batcher.WithInterval(10*time.Second), // 两条 Do 只能靠 Close 唤醒
+	)
+
+	results := make(chan int, 2)
+	for i := 1; i <= 2; i++ {
+		go func(i int) {
+			res, err := b.Do(context.Background(), i)
+			if err != nil {
+				t.Errorf("Do(%d): %v", i, err)
+			}
+			results <- res
+		}(i)
+	}
+	time.Sleep(50 * time.Millisecond) // 确保两条都已入队组批
+
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	got := []int{<-results, <-results}
+	sort.Ints(got)
+	if fmt.Sprint(got) != "[1 2]" {
+		t.Fatalf("results = %v, want [1 2]", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("fn calls = %d, want 1 (one final flush)", len(calls))
+	}
+}
+
+func TestDoAfterCloseReturnsErrClosed(t *testing.T) {
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		return append([]int(nil), reqs...), nil
+	}
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+	)
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := b.Do(context.Background(), 1); !errors.Is(err, batcher.ErrClosed) {
+		t.Fatalf("Do after Close = %v, want ErrClosed", err)
+	}
+}
+
+func TestCloseIdempotentAndConcurrent(t *testing.T) {
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		return append([]int(nil), reqs...), nil
+	}
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+	)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := b.Close(context.Background()); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("sequential second Close: %v", err)
+	}
+}
+
+func TestCloseWithoutPendingSkipsBatchFunction(t *testing.T) {
+	var calls atomic.Int64
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		calls.Add(1)
+		return append([]int(nil), reqs...), nil
+	}
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+	)
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("fn calls = %d, want 0 (no data, no flush)", n)
+	}
+}
+
+func TestCloseTimeoutGivesUpButFlushCompletesInBackground(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		entered <- struct{}{}
+		<-release // 模拟慢批次，Close 必然超时
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+	)
+
+	resCh := make(chan int, 1)
+	go func() {
+		res, err := b.Do(context.Background(), 5)
+		if err != nil {
+			t.Errorf("Do: %v", err)
+		}
+		resCh <- res
+	}()
+	<-entered // 批次已 in-flight
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := b.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close timeout = %v, want DeadlineExceeded", err)
+	}
+
+	close(release) // 放行慢批次
+	select {
+	case res := <-resCh:
+		if res != 5 {
+			t.Fatalf("res = %d, want 5", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter never resolved after background flush")
+	}
+}
+
+func TestCallerCancelReturnsEarlyItemRetainedAndFnCtxUnaffected(t *testing.T) {
+	var mu sync.Mutex
+	var calls [][]int
+	var fnCtxErr error
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, append([]int(nil), reqs...))
+		fnCtxErr = ctx.Err() // 调用方取消不得波及批次函数的 ctx
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(10),
+		batcher.WithInterval(150*time.Millisecond),
+	)
+	defer func() {
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(30*time.Millisecond, cancel) // 先入队、等待中取消（早于 150ms flush）
+	cancelledRes := make(chan error, 1)
+	go func() {
+		_, err := b.Do(ctx, 1)
+		cancelledRes <- err
+	}()
+	okRes := make(chan int, 1)
+	go func() {
+		res, err := b.Do(context.Background(), 2)
+		if err != nil {
+			t.Errorf("Do(2): %v", err)
+		}
+		okRes <- res
+	}()
+
+	select {
+	case err := <-cancelledRes:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled waiter err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled waiter did not return early")
+	}
+
+	if res := <-okRes; res != 2 {
+		t.Fatalf("surviving waiter res = %d, want 2", res)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("fn calls = %d, want 1", len(calls))
+	}
+	got := append([]int(nil), calls[0]...)
+	sort.Ints(got)
+	if fmt.Sprint(got) != "[1 2]" {
+		t.Fatalf("batch = %v, want [1 2]（取消的 Item 保留执行）", got)
+	}
+	if fnCtxErr != nil {
+		t.Fatalf("fn ctx err = %v, want nil（基础 ctx 不受调用方取消影响）", fnCtxErr)
+	}
+}
+
+func TestSingleInFlightBatch(t *testing.T) {
+	var cur, maxSeen atomic.Int64
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		n := cur.Add(1)
+		for {
+			m := maxSeen.Load()
+			if n <= m || maxSeen.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+		cur.Add(-1)
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+	)
+	defer func() {
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}()
+
+	const n = 4
+	errs := make(chan error, n)
+	for i := 1; i <= n; i++ {
+		go func(i int) {
+			res, err := b.Do(context.Background(), i)
+			if err == nil && res != i {
+				t.Errorf("Do(%d) = %d", i, res)
+			}
+			errs <- err
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+	}
+	if m := maxSeen.Load(); m != 1 {
+		t.Fatalf("max concurrent batch functions = %d, want 1", m)
+	}
+}
+
+// identityFn 是最简单的批次函数：原样返回请求。
+func identityFn(ctx context.Context, reqs []int) ([]int, error) {
+	return append([]int(nil), reqs...), nil
+}
+
+// ADR-0002：计时器自组批起算，慢执行后不按到达时刻补偿——
+// 停泊 Item 等待已久也不会立即触发碎片小批。
+func TestSlowBatchDoesNotCompensateTimerByArrival(t *testing.T) {
+	var mu sync.Mutex
+	callStart := []time.Time{}
+	callEnd := []time.Time{}
+	entered := make(chan struct{}, 2)
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		mu.Lock()
+		callStart = append(callStart, time.Now())
+		mu.Unlock()
+		entered <- struct{}{}
+		if len(callStart) == 1 {
+			time.Sleep(300 * time.Millisecond) // 第一批慢执行，期间新 Item 停泊
+		}
+		mu.Lock()
+		callEnd = append(callEnd, time.Now())
+		mu.Unlock()
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(2), // 前两条按 size 立即 flush，与 interval 无关
+		batcher.WithInterval(100*time.Millisecond),
+	)
+	defer func() {
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}()
+
+	go func() { _, _ = b.Do(context.Background(), 1) }()
+	go func() { _, _ = b.Do(context.Background(), 2) }()
+	<-entered // 第一批已开始慢执行
+
+	go func() { _, _ = b.Do(context.Background(), 3) }() // 慢执行期间停泊
+
+	<-entered // 第二批已触发
+	time.Sleep(50 * time.Millisecond) // 等第二批 callEnd 记录
+	mu.Lock()
+	defer mu.Unlock()
+	if len(callStart) != 2 {
+		t.Fatalf("fn calls = %d, want 2", len(callStart))
+	}
+	// 第二批的组批计时器自第一批执行完毕起算，需再等满 interval；
+	// 若按到达时刻补偿（item 3 已等 300ms > interval），则 gap ≈ 0。
+	if gap := callStart[1].Sub(callEnd[0]); gap < 80*time.Millisecond {
+		t.Fatalf("second batch started %v after first finished, want >= ~100ms（组批起算，不补偿）", gap)
+	}
+}
