@@ -136,23 +136,22 @@ func TestObserverReceivesLifecycleAndFlushEvents(t *testing.T) {
 		return append([]int(nil), reqs...), nil
 	}
 
-	interval := 50 * time.Millisecond
+	interval := 500 * time.Millisecond // 放宽组批窗口；实际由 size=2 触发，无需等满
 	b := batcher.New[int, int](fn,
 		batcher.WithMaxSize(2),
 		batcher.WithInterval(interval),
 		batcher.WithObserver(obs),
 	)
-	var wg sync.WaitGroup
-	for i := 1; i <= 2; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if _, err := b.Do(context.Background(), i); err != nil {
-				t.Errorf("Do(%d): %v", i, err)
-			}
-		}(i)
-	}
-	wg.Wait() // size=2 已触发 flush 并交付，才可 Close
+	done := make(chan struct{}, 2)
+	release := launchTogether(2, func(i int) {
+		defer func() { done <- struct{}{} }()
+		if _, err := b.Do(context.Background(), i+1); err != nil {
+			t.Errorf("Do(%d): %v", i+1, err)
+		}
+	})
+	release()
+	<-done
+	<-done // size=2 已触发 flush 并交付，才可 Close
 	if err := b.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -451,20 +450,20 @@ func TestEventOrderingAndOnClosedExactlyOnce(t *testing.T) {
 	obs := &seqObserver{}
 	b := batcher.New[int, int](identityFn,
 		batcher.WithMaxSize(2),
-		batcher.WithInterval(50*time.Millisecond),
+		batcher.WithInterval(500*time.Millisecond), // 放宽组批窗口；两批均由 size=2 触发
 		batcher.WithObserver(obs),
 	)
-	var wg sync.WaitGroup
-	for i := 1; i <= 4; i++ { // 两批
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if _, err := b.Do(context.Background(), i); err != nil {
-				t.Errorf("Do(%d): %v", i, err)
-			}
-		}(i)
+	done := make(chan struct{}, 4)
+	release := launchTogether(4, func(i int) { // 两批：任一到达序都配成 2+2
+		defer func() { done <- struct{}{} }()
+		if _, err := b.Do(context.Background(), i+1); err != nil {
+			t.Errorf("Do(%d): %v", i+1, err)
+		}
+	})
+	release()
+	for i := 0; i < 4; i++ {
+		<-done
 	}
-	wg.Wait()
 
 	var closeWg sync.WaitGroup
 	for i := 0; i < 5; i++ {

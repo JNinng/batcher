@@ -21,6 +21,27 @@ type sizeResult struct {
 	err error
 }
 
+// launchTogether 并发启动 n 个 goroutine，全部停泊在起跑线后由
+// release 一次性放行（真屏障），消除 spawn 调度抖动对组批时序的
+// 干扰。放行后到进入 Do 之间仍可能有个别 goroutine 被调度延迟，
+// 故组批断言仍需与 interval 之间保留充足余量。
+func launchTogether(n int, fn func(i int)) (release func()) {
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			ready.Done()
+			<-start
+			fn(i)
+		}(i)
+	}
+	return func() {
+		ready.Wait()
+		close(start)
+	}
+}
+
 func TestSizeTriggerFlushesOneBatchWithPositionalResults(t *testing.T) {
 	var mu sync.Mutex
 	var calls [][]int
@@ -92,7 +113,7 @@ func TestIntervalTriggerFlushesPartialBatch(t *testing.T) {
 		return res, nil
 	}
 
-	const interval = 150 * time.Millisecond
+	const interval = 500 * time.Millisecond // 组批窗口放宽：屏障放行后仍需容纳调度余量
 	b := batcher.New[int, int](fn,
 		batcher.WithMaxSize(100), // 测试期内绝不触发，隔离 interval 条件
 		batcher.WithInterval(interval),
@@ -103,22 +124,21 @@ func TestIntervalTriggerFlushesPartialBatch(t *testing.T) {
 		}
 	}()
 
+	done := make(chan struct{}, 2)
+	release := launchTogether(2, func(i int) {
+		defer func() { done <- struct{}{} }()
+		res, err := b.Do(context.Background(), i+1)
+		if err != nil {
+			t.Errorf("Do(%d) error: %v", i+1, err)
+		}
+		if res != i+1 {
+			t.Errorf("Do(%d) = %d, want %d", i+1, res, i+1)
+		}
+	})
 	started := time.Now()
-	var wg sync.WaitGroup
-	for i := 1; i <= 2; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			res, err := b.Do(context.Background(), i)
-			if err != nil {
-				t.Errorf("Do(%d) error: %v", i, err)
-			}
-			if res != i {
-				t.Errorf("Do(%d) = %d, want %d", i, res, i)
-			}
-		}(i)
-	}
-	wg.Wait()
+	release()
+	<-done
+	<-done
 	elapsed := time.Since(started)
 
 	// interval 是唯一触发条件：必须等满，且未久等。
@@ -421,7 +441,7 @@ func TestCallerCancelReturnsEarlyItemRetainedAndFnCtxUnaffected(t *testing.T) {
 
 	b := batcher.New[int, int](fn,
 		batcher.WithMaxSize(10),
-		batcher.WithInterval(150*time.Millisecond),
+		batcher.WithInterval(300*time.Millisecond), // 窗口放宽：容纳屏障放行后的调度余量
 	)
 	defer func() {
 		if err := b.Close(context.Background()); err != nil {
@@ -430,20 +450,22 @@ func TestCallerCancelReturnsEarlyItemRetainedAndFnCtxUnaffected(t *testing.T) {
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(30*time.Millisecond, cancel) // 先入队、等待中取消（早于 150ms flush）
+	time.AfterFunc(30*time.Millisecond, cancel) // 先入队、等待中取消（远早于 300ms flush）
 	cancelledRes := make(chan error, 1)
-	go func() {
-		_, err := b.Do(ctx, 1)
-		cancelledRes <- err
-	}()
 	okRes := make(chan int, 1)
-	go func() {
+	release := launchTogether(2, func(i int) {
+		if i == 0 {
+			_, err := b.Do(ctx, 1)
+			cancelledRes <- err
+			return
+		}
 		res, err := b.Do(context.Background(), 2)
 		if err != nil {
 			t.Errorf("Do(2): %v", err)
 		}
 		okRes <- res
-	}()
+	})
+	release()
 
 	select {
 	case err := <-cancelledRes:
@@ -555,8 +577,10 @@ func TestSlowBatchDoesNotCompensateTimerByArrival(t *testing.T) {
 		}
 	}()
 
-	go func() { _, _ = b.Do(context.Background(), 1) }()
-	go func() { _, _ = b.Do(context.Background(), 2) }()
+	release := launchTogether(2, func(i int) {
+		_, _ = b.Do(context.Background(), i+1) // 屏障确保同批：size=2 立即触发
+	})
+	release()
 	<-entered // 第一批已开始慢执行
 
 	go func() { _, _ = b.Do(context.Background(), 3) }() // 慢执行期间停泊

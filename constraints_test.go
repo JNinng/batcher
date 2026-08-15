@@ -122,7 +122,7 @@ func TestCancelledWaitersStillExecuteAndPendingDrainsToZero(t *testing.T) {
 		return append([]int(nil), reqs...), nil
 	}
 
-	const interval = 150 * time.Millisecond
+	const interval = 500 * time.Millisecond // 组批窗口放宽：屏障放行后仍需容纳调度余量
 	b := batcher.New[int, int](fn,
 		batcher.WithMaxSize(100), // 只靠 interval 触发，制造充足取消窗口
 		batcher.WithInterval(interval),
@@ -132,34 +132,34 @@ func TestCancelledWaitersStillExecuteAndPendingDrainsToZero(t *testing.T) {
 	const n = 20
 	results := make(chan int, n)
 	cancelled := make(chan int, n)
-	var wg sync.WaitGroup
-	for i := 1; i <= n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			ctx, cancel := context.WithCancel(context.Background())
-			if i%2 == 0 {
-				time.AfterFunc(30*time.Millisecond, cancel) // 等待中取消
+	release := launchTogether(n, func(i int) {
+		id := i + 1
+		ctx, cancel := context.WithCancel(context.Background())
+		if id%2 == 0 {
+			time.AfterFunc(30*time.Millisecond, cancel) // 等待中取消
+		}
+		res, err := b.Do(ctx, id)
+		cancel()
+		switch {
+		case err == nil:
+			if res != id {
+				t.Errorf("Do(%d) = %d", id, res)
 			}
-			res, err := b.Do(ctx, i)
-			cancel()
-			switch {
-			case err == nil:
-				if res != i {
-					t.Errorf("Do(%d) = %d", i, res)
-				}
-				results <- i
-			case errors.Is(err, context.Canceled):
-				cancelled <- i
-			default:
-				t.Errorf("Do(%d) err = %v", i, err)
-			}
-		}(i)
-	}
-	wg.Wait()
-
-	if got := len(results) + len(cancelled); got != n {
-		t.Fatalf("resolved %d of %d", got, n)
+			results <- id
+		case errors.Is(err, context.Canceled):
+			cancelled <- id
+		default:
+			t.Errorf("Do(%d) err = %v", id, err)
+		}
+	})
+	release()
+	for resolved := 0; resolved < n; {
+		select {
+		case <-results:
+			resolved++
+		case <-cancelled:
+			resolved++
+		}
 	}
 	mu.Lock()
 	defer mu.Unlock()
