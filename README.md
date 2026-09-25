@@ -1,0 +1,122 @@
+# batcher
+
+将零散的单次请求扇入为批量操作，并把结果按位置归还各调用方的 Go 库。
+
+典型场景：上游持续到达 `get user by id` 这类单条查询，下游只提供 `batch get users` 这类批量接口。`batcher` 在两者之间把并发到达的单条请求合并为一次批量调用，每个调用方同步等待自己那份结果，如同调用了一个普通的单条接口。
+
+## 特性
+
+- **同步 `Do`，按位置对位**：`Do(ctx, req)` 阻塞直到自己那份结果返回；批次函数返回与入参等长、同序的结果切片，长度不符视为整批失败。
+- **先到先触发**：批大小上限或时间间隔（自组批起算）先到先触发 Flush；仅有数据才触发，批次函数永远不会收到空切片。
+- **串行单在途**：同一时刻至多一个 In-flight Batch，下游并发恒为 1，行为可预测。
+- **批级错误广播**：批次函数返回的非 nil 错误（含 panic 经 recover 转化）广播给该批全部 Waiter，不重试；库继续可用。
+- **取消不改变批次形状**：调用方取消仅解除自身等待，其 Item 保留照常执行、结果丢弃；批次的 size 与对位绝不因取消而变化。
+- **优雅关闭**：`Close` 立即 flush 未满批并等待在途批次完成，正常返回即全部已入队 Waiter 已被唤醒；幂等、可并发调用。
+- **旁路可观测**：类型化 `Observer` 事件、`observ.Meter` 指标、结构化日志；Observer 与 Meter 默认 Noop，日志未注入时构造期快照 `observ.DefaultLogger()`。
+
+## 安装
+
+```bash
+go get github.com/jninng/batcher
+```
+
+要求 Go 1.26.2+。
+
+## 快速开始
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/jninng/batcher"
+)
+
+func main() {
+	// 批次函数：接收整个 Batch（恒非空），返回等长结果切片。
+	queryUsers := func(ctx context.Context, ids []int) ([]string, error) {
+		users := make([]string, len(ids))
+		for i, id := range ids {
+			users[i] = fmt.Sprintf("user-%d", id)
+		}
+		return users, nil
+	}
+
+	b := batcher.New(queryUsers,
+		batcher.WithMaxSize(10),                // 攒够 10 条立即 Flush
+		batcher.WithInterval(50*time.Millisecond), // 否则自组批起 50ms 后 Flush
+	)
+	defer b.Close(context.Background())
+
+	// 多个 goroutine 并发调用 Do，各自阻塞等待自己的结果。
+	res, err := b.Do(context.Background(), 42)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(res) // user-42
+}
+```
+
+完整可运行示例见 [examples/httpserver](examples/httpserver)——一个把并发 HTTP 单查扇入为下游批量查询的服务，演示两种 Flush 触发与旁路观测：
+
+```bash
+go run ./examples/httpserver
+```
+
+## 核心语义
+
+| 语义 | 行为 |
+| --- | --- |
+| Flush 触发 | 批大小上限或时间间隔先到先触发；时间间隔自组批起点（第一条 Item 进入空批）起算，是尽力而为的软上限。空批不计时、不唤醒。 |
+| 下游并发 | 恒为 1：批次函数执行期间新 Item 只排队，不产生并发批量调用。 |
+| 批级错误 | 批次函数返回非 nil 错误、panic、或结果长度与请求不符，整批所有 Waiter 收到同一错误，不重试。单条业务失败由你在结果类型中自行表达。 |
+| 调用方取消 | `Do` 的 ctx 取消即返回 `ctx.Err()`，Item 保留在批中照常执行、结果丢弃。批次函数运行于 batcher 级基础 ctx，不携带任何单个调用方的 deadline。 |
+| Close | 先到达的 Do 立即返回 `ErrClosed`；`Close(ctx)` flush 未满批并等待在途批次完成后才返回，ctx 超时仅放弃等待（后台 flush 照常完成），返回 `ctx.Err()`。 |
+
+## 配置选项
+
+| 选项 | 说明 |
+| --- | --- |
+| `WithMaxSize(n)` | **必填**，批大小上限，必须 > 0。 |
+| `WithInterval(d)` | **必填**，组批时间间隔，必须 > 0。 |
+| `WithObserver(o)` | 注入 `Observer` 旁路观测，默认 `NoopObserver`。 |
+| `WithMeter(m)` | 注入 `observ.Meter` 指标，默认 Noop。 |
+| `WithLogger(l)` | 注入 `observ.Logger` 日志，未注入时构造期快照默认 Logger。 |
+
+`fn` 为 nil、必填选项缺失或非正属程序员工错，`New` 构造期 panic。
+
+## 可观测性
+
+**Observer**（类型化旁路事件，回调在派发 goroutine 同步执行，必须快速返回；回调 panic 会被库 recover）：
+
+```go
+type Observer interface {
+	OnCreated(CreatedEvent)        // 构造时触发一次
+	OnBatchFlushed(BatchFlushedEvent) // 每批一次：Size / WaitSeconds / DurationSeconds / Err
+	OnClosed(ClosedEvent)          // dispatcher 退出前触发一次
+}
+```
+
+**指标**（注入 `observ.Meter` 后启用，命名遵循 `_total` / `_seconds` / `_depth` 约定）：
+
+| 指标 | 类型 | 含义 |
+| --- | --- | --- |
+| `batcher_batch_total` | Counter | 已 flush 的批次数 |
+| `batcher_batch_failed_total` | Counter | 以 Batch Error 结束的批次数 |
+| `batcher_wait_seconds` | Histogram | 单条 Item 从入队到结果交付的端到端等待 |
+| `batcher_batch_size` | Histogram | 每批 Item 数量 |
+| `batcher_batch_duration_seconds` | Histogram | 批次函数执行耗时 |
+| `batcher_queue_depth` | Gauge | 已接收未完成的 Item 数（批边界刷新） |
+
+## 设计文档
+
+术语表见 [CONTEXT.md](CONTEXT.md)，设计决策见 [docs/adr](docs/adr)：
+
+- [0001 同步 Do、按位置对位与批级错误](docs/adr/0001-sync-do-positional-api.md)
+- [0002 串行单在途批次，计时器自组批起算](docs/adr/0002-serial-single-inflight.md)
+- [0003 调用方取消仅解除自身等待，Item 保留照常执行](docs/adr/0003-cancel-retains-item.md)
+
+按 key 去重（singleflight 语义）明确不在范围内。
