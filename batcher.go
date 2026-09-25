@@ -177,7 +177,6 @@ func (b *Batcher[Req, Res]) Close(ctx context.Context) error {
 // pending 记账在接收侧完成（收到即 Add(1)，交付后 Add(-1)）：
 // 无缓冲握手下发送方的增量可能滞后于整批交付，接收侧记账保证
 // 先增后减的顺序，queue_depth 不出现负值。
-
 func (b *Batcher[Req, Res]) run() {
 	defer b.baseCancel()
 	defer func() {

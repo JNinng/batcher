@@ -354,7 +354,7 @@ func TestObserverPanicOnEveryEventIsRecovered(t *testing.T) {
 	}
 }
 
-// 约束（Round1-Q7 口径）：WaitSeconds 是组批耗时——size 触发时远小于
+// 约束：WaitSeconds 是组批耗时——size 触发时远小于
 // interval，interval 触发时不小于 interval。
 func TestFlushEventWaitSecondsSemantics(t *testing.T) {
 	t.Run("size-trigger-below-interval", func(t *testing.T) {
