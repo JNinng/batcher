@@ -10,6 +10,7 @@
 - **先到先触发**：批大小上限或时间间隔（自组批起算）先到先触发 Flush；仅有数据才触发，批次函数永远不会收到空切片。
 - **串行单在途**：同一时刻至多一个 In-flight Batch，下游并发恒为 1，行为可预测。
 - **有界队列 + 负载卸载**：`WithMaxPending(n)` 限制已准入未交付的提交数（含停泊在握手上的发送方），达上限新 `Do` 立即返回 `ErrOverloaded`，避免 goroutine 无界堆积。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝。
+- **批内 key 去重**：`NewKeyed` 把同 key 的并发请求折叠为一次执行——批次函数收到去重切片（首次出现序），同 key 的 Waiter 共享结果；maxSize 仍按原始条数计数，事件双口径 `Size` / `UniqueSize`。
 - **批级错误广播**：批次函数返回的非 nil 错误（含 panic 经 recover 转化）广播给该批全部 Waiter，不重试；库继续可用。
 - **取消不改变批次形状**：调用方取消仅解除自身等待，其 Item 保留照常执行、结果丢弃；批次的 size 与对位绝不因取消而变化。
 - **优雅关闭**：`Close` 立即 flush 未满批并等待在途批次完成，正常返回即全部已入队 Waiter 已被唤醒；幂等、可并发调用。
@@ -74,6 +75,7 @@ go run ./examples/httpserver
 | Flush 触发 | 批大小上限或时间间隔先到先触发；时间间隔自组批起点（第一条 Item 进入空批）起算，是尽力而为的软上限。空批不计时、不唤醒。 |
 | 下游并发 | 恒为 1：批次函数执行期间新 Item 只排队，不产生并发批量调用。 |
 | 负载卸载 | 配置 `WithMaxPending(n)` 后，已准入未交付的提交数达 n 即拒绝：新 `Do` 立即返回 `ErrOverloaded`，不入队。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝（其他提交的拒绝尚未回滚、计数瞬时虚高），被拒调用方可退避重试。Formation 与在途中的 Item 同样占用额度：批次大小恒不超过 n，n < MaxSize 时批大小触发不可达。未配置即无界。 |
+| 批内去重 | `NewKeyed(key, fn)` 在交付边界折叠同 key Item：批次函数收到去重切片（首次出现序，重复 key 只首达 Req 送达下游），`len(res) == len(unique)`，同 key 的 Waiter 共享同一条执行、各自取得一份结果。「key 相同 ⇒ 语义等价」由 key 函数的提供方声明。maxSize 按原始条数计数，重复照常占槽触发 Flush；跨批去重不做，执行期到达的重复 key 落入下一批重查；key 函数 panic 降级为批级错误、库继续可用。 |
 | 批级错误 | 批次函数返回非 nil 错误、panic、或结果长度与请求不符，整批所有 Waiter 收到同一错误，不重试。单条业务失败由你在结果类型中自行表达。 |
 | 调用方取消 | `Do` 的 ctx 取消即返回 `ctx.Err()`，Item 保留在批中照常执行、结果丢弃。批次函数运行于 batcher 级基础 ctx，不携带任何单个调用方的 deadline。 |
 | Close | 先到达的 Do 立即返回 `ErrClosed`；`Close(ctx)` flush 未满批并等待在途批次完成后才返回，ctx 超时仅放弃等待（后台 flush 照常完成），返回 `ctx.Err()`。 |
@@ -98,7 +100,7 @@ go run ./examples/httpserver
 ```go
 type Observer interface {
 	OnCreated(CreatedEvent)        // 构造时触发一次
-	OnBatchFlushed(BatchFlushedEvent) // 每批一次：Size / WaitSeconds / DurationSeconds / Err
+	OnBatchFlushed(BatchFlushedEvent) // 每批一次：Size / UniqueSize / WaitSeconds / DurationSeconds / Err
 	OnClosed(ClosedEvent)          // dispatcher 退出前触发一次
 }
 ```
@@ -122,5 +124,6 @@ type Observer interface {
 - [0001 同步 Do、按位置对位与批级错误](docs/adr/0001-sync-do-positional-api.md)
 - [0002 串行单在途批次，计时器自组批起算](docs/adr/0002-serial-single-inflight.md)
 - [0003 调用方取消仅解除自身等待，Item 保留照常执行](docs/adr/0003-cancel-retains-item.md)
+- [0004 批内 key 去重：独立构造器 NewKeyed，折叠在交付边界](docs/adr/0004-keyed-in-batch-dedup.md)
 
-按 key 去重（singleflight 语义）明确不在范围内。
+`New` 不做批内去重；`NewKeyed` 提供批内 key 去重，「key 相同 ⇒ 语义等价」由 key 函数声明（ADR 0004）。

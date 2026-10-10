@@ -38,3 +38,7 @@ _Avoid_: partial error
 **Admission**:
 提交进入 batcher 的守门动作：入口计数加一计入「已准入未交付」，超过 `WithMaxPending` 上限即拒绝并返回 `ErrOverloaded`（负载卸载），交付时释放额度。已准入提交数恒不超过上限；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝（其他提交的拒绝尚未回滚、计数瞬时虚高）。
 _Avoid_: rate limit（不限速率，只限同时在库提交数）、throttle、backpressure
+
+**Fold**:
+交付边界把批内同 key 的多条 Item 合并为一条执行的动作（`NewKeyed` 启用）：批次函数收到保持首次出现序的去重切片，重复 key 只首达 Req 送达下游，结果回填至全部原始位置。重复 Item 照常占槽触发 Flush，maxSize 按原始条数计数。
+_Avoid_: merge、collapse、singleflight（实现手法名）
