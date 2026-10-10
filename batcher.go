@@ -8,6 +8,9 @@
 //   - 同一时刻至多一个 In-flight Batch，下游并发恒为 1；
 //   - 准入可有界（WithMaxPending）：已准入未交付的提交数达上限即负载
 //     卸载，新 Do 立即返回 ErrOverloaded，避免 goroutine 无界堆积；
+//   - 批内可按 key 去重（NewKeyed）：批次函数收到去重切片，同 key 的
+//     Waiter 共享同一条执行；折叠发生在交付边界，重复 Item 照常占槽
+//     触发 Flush；
 //   - 批级错误（含批次函数 panic 降级）广播给该批全部 Waiter，不重试；
 //   - 调用方取消仅解除自身等待，Item 保留照常执行；
 //   - 批次函数运行于 batcher 级基础 ctx；Close 正常返回即全部已入队
@@ -50,13 +53,19 @@ type item[Req, Res any] struct {
 	resCh     chan result[Res]
 }
 
+// foldFunc 把原始批折叠为按 key 去重的切片（保持首次出现序），连同
+// 结果回填函数 scatter——它把批次函数对去重切片的结果按原位置展开，
+// 同 key 的 Item 共享同一条结果。err 非 nil 即整批失败。
+type foldFunc[Req, Res any] func(reqs []Req) (unique []Req, scatter func(res []Res) []Res, err error)
+
 // Batcher 将零散 Do 扇入为批量调用。构造后即可并发使用 Do；
 // 用毕必须 Close。
 type Batcher[Req, Res any] struct {
 	fn         BatchFunc[Req, Res]
 	maxSize    int
 	interval   time.Duration
-	maxPending int // 已准入未交付提交数上限；0 即无界
+	maxPending int                // 已准入未交付提交数上限；0 即无界
+	fold       foldFunc[Req, Res] // 批内 key 折叠，NewKeyed 注入；New 为 nil
 
 	inbox    chan *item[Req, Res] // 无缓冲：执行期间新 Item 停靠在此；停泊发送方已过准入，计入 admitted
 	closing  chan struct{}        // Close 已开始，新 Do 立即 ErrClosed
@@ -83,6 +92,27 @@ type Batcher[Req, Res any] struct {
 // New 构造 Batcher 并启动 dispatcher。fn 为 nil、MaxSize/Interval
 // 缺失或非正、MaxPending 为负属程序员工错，构造期 panic。
 func New[Req, Res any](fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res] {
+	return newBatcher(fn, nil, opts...)
+}
+
+// NewKeyed 构造批内按 key 去重的 Batcher 并启动
+// dispatcher：批次函数收到去重后的 []Req（保持首次出现序，重复 key
+// 只首个 Req 送达下游），返回 len(res) == len(unique) 的结果切片，
+// 同 key 的多 Waiter 共享同一条执行、各自取得一份结果，位置对位语义
+// 对去重切片成立。「key 相同 ⇒ 语义等价」由 key 函数的提供方声明，
+// 库不代猜。maxSize 仍按原始条数计数——重复 Item 照常占槽触发 Flush，
+// 折叠发生在交付边界，否则单一热点 key 的流永远凑不满 maxSize 个
+// unique。跨批去重不做：执行期到达的重复 key 落入下一批重查。
+// key 或 fn 为 nil 属程序员工错；选项校验同 New。均为构造期 panic。
+func NewKeyed[K comparable, Req, Res any](key func(Req) K, fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res] {
+	if key == nil {
+		panic("batcher: key function must not be nil")
+	}
+	return newBatcher(fn, foldByKey[K, Req, Res](key), opts...)
+}
+
+// newBatcher 是组批层构造器的统一装配点（返回同一个 *Batcher）。
+func newBatcher[Req, Res any](fn BatchFunc[Req, Res], fold foldFunc[Req, Res], opts ...Option) *Batcher[Req, Res] {
 	if fn == nil {
 		panic("batcher: batch function must not be nil")
 	}
@@ -115,6 +145,7 @@ func New[Req, Res any](fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res
 		maxSize:    cfg.maxSize,
 		interval:   cfg.interval,
 		maxPending: cfg.maxPending,
+		fold:       fold,
 		inbox:      make(chan *item[Req, Res]),
 		closing:    make(chan struct{}),
 		shutdown:   make(chan struct{}),
@@ -134,6 +165,54 @@ func New[Req, Res any](fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res
 		slog.Duration("interval", cfg.interval),
 	)
 	return b
+}
+
+// foldByKey 生成批内折叠器：位置表 pos 在折叠时一次算好，scatter 仅
+// 做下标回填、不再调 key 函数（回填发生在 callFn 的 recover 之外，
+// 二次调用会重新引入 panic 面）。
+func foldByKey[K comparable, Req, Res any](key func(Req) K) foldFunc[Req, Res] {
+	return func(reqs []Req) (unique []Req, scatter func(res []Res) []Res, err error) {
+		pos := make([]int, len(reqs)) // pos[i]：reqs[i] 在去重切片中的下标
+		seen := make(map[K]int, len(reqs))
+		unique = make([]Req, 0, len(reqs))
+		for i, req := range reqs {
+			k, kerr := callKey(key, req)
+			if kerr != nil {
+				return nil, nil, kerr
+			}
+			if j, ok := seen[k]; ok {
+				pos[i] = j
+				continue
+			}
+			pos[i] = len(unique)
+			seen[k] = len(unique)
+			unique = append(unique, req)
+		}
+		scatter = func(res []Res) []Res {
+			out := make([]Res, len(reqs))
+			for i := range reqs {
+				out[i] = res[pos[i]]
+			}
+			return out
+		}
+		return unique, scatter, nil
+	}
+}
+
+// recoverAsBatchError 供 callKey / callFn 的 defer 使用：panic 降级为
+// Batch Error 形态的错误，保证库继续可用。
+func recoverAsBatchError(what string, errp *error) {
+	if r := recover(); r != nil {
+		*errp = fmt.Errorf("batcher: %s panicked: %v", what, r)
+	}
+}
+
+// callKey 调用 key 函数，panic 降级为 Batch Error。折叠运行于
+// dispatcher goroutine 且发生在 callFn 的 recover 域之外，此处不
+// recover 则 panic 打穿 dispatcher、进程崩溃。
+func callKey[K comparable, Req any](key func(Req) K, req Req) (k K, err error) {
+	defer recoverAsBatchError("key function", &err)
+	return key(req), nil
 }
 
 // Do 提交一条 Item 并阻塞等待自己那份结果。调用方 ctx 只治理本次
@@ -292,13 +371,8 @@ func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time
 
 	waitSeconds := time.Since(formationStart).Seconds() // 组批耗时：入批 → Flush 触发
 	started := time.Now()
-	res, err := b.callFn(reqs)
+	res, uniqueSize, err := b.callBatch(reqs)
 	durationSeconds := time.Since(started).Seconds()
-
-	// 长度契约：结果与请求不等长视为整批失败。
-	if err == nil && len(res) != len(reqs) {
-		err = fmt.Errorf("batcher: batch function returned %d results for %d requests", len(res), len(reqs))
-	}
 
 	for i, it := range batch {
 		var r Res
@@ -323,20 +397,40 @@ func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time
 	}
 	b.emitFlushed(BatchFlushedEvent{
 		Size:            len(batch),
+		UniqueSize:      uniqueSize,
 		WaitSeconds:     waitSeconds,
 		DurationSeconds: durationSeconds,
 		Err:             err,
 	})
 }
 
+// callBatch 执行一批：keyed 批先折叠为去重切片再调用批次函数，结果
+// 回填至原始位置（同 key Waiter 共享同一条结果）；长度契约（ADR-0001）
+// 对去重切片成立。返回去重后条数供事件口径；折叠失败（keyFn panic）
+// 时为 0。
+func (b *Batcher[Req, Res]) callBatch(reqs []Req) (res []Res, uniqueSize int, err error) {
+	unique := reqs
+	var scatter func([]Res) []Res
+	if b.fold != nil {
+		unique, scatter, err = b.fold(reqs)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	res, err = b.callFn(unique)
+	// 长度契约：结果与请求不等长视为整批失败。
+	if err == nil && len(res) != len(unique) {
+		err = fmt.Errorf("batcher: batch function returned %d results for %d requests", len(res), len(unique))
+	}
+	if err == nil && scatter != nil {
+		res = scatter(res)
+	}
+	return res, len(unique), err
+}
+
 // callFn 调用用户批次函数，panic 降级为 Batch Error，保证库继续可用。
 func (b *Batcher[Req, Res]) callFn(reqs []Req) (res []Res, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			res = nil
-			err = fmt.Errorf("batcher: batch function panicked: %v", r)
-		}
-	}()
+	defer recoverAsBatchError("batch function", &err)
 	return b.fn(b.baseCtx, reqs)
 }
 

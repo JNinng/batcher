@@ -175,6 +175,9 @@ func TestObserverReceivesLifecycleAndFlushEvents(t *testing.T) {
 	if f.Size != 2 || f.Err != nil || f.WaitSeconds < 0 || f.DurationSeconds < 0 {
 		t.Fatalf("flushed event = %+v, want {Size:2 Err:nil 非负耗时}", f)
 	}
+	if f.UniqueSize != f.Size {
+		t.Fatalf("UniqueSize = %d, want == Size %d（普通 New 不去重）", f.UniqueSize, f.Size)
+	}
 	if obs.closed != 1 {
 		t.Fatalf("closed events = %d, want 1", obs.closed)
 	}

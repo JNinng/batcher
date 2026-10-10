@@ -3,6 +3,7 @@ package batcher_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -74,4 +75,48 @@ func ExampleBatcher() {
 	}
 	fmt.Println(res)
 	// Output: user-42
+}
+
+// ExampleNewKeyed 展示批内 key 去重：同 key 的并发请求共享一次下游执行。
+func ExampleNewKeyed() {
+	var fnCalls int
+	queryUsers := func(ctx context.Context, ids []int) ([]string, error) {
+		fnCalls++
+		users := make([]string, len(ids))
+		for i, id := range ids {
+			users[i] = fmt.Sprintf("user-%d", id)
+		}
+		return users, nil
+	}
+
+	b := batcher.NewKeyed(func(id int) int { return id }, queryUsers,
+		batcher.WithMaxSize(3),
+		batcher.WithInterval(50*time.Millisecond),
+	)
+	defer b.Close(context.Background())
+
+	// 3 个并发请求中 2 个是同一 id：折叠后批次函数只收到 2 条 unique。
+	ids := []int{42, 42, 7}
+	results := make([]string, len(ids))
+	var wg sync.WaitGroup
+	wg.Add(len(ids))
+	release := launchTogether(len(ids), func(i int) {
+		defer wg.Done()
+		res, err := b.Do(context.Background(), ids[i])
+		if err != nil {
+			panic(err)
+		}
+		results[i] = res
+	})
+	release() // 屏障确保三条请求同批到达，fnCalls 断言不依赖调度时序
+	wg.Wait()
+	for _, res := range results {
+		fmt.Println(res)
+	}
+	fmt.Println("batch fn calls:", fnCalls)
+	// Output:
+	// user-42
+	// user-42
+	// user-7
+	// batch fn calls: 1
 }
