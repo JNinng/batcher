@@ -110,7 +110,7 @@ func TestManyBatchesPositionalIntegrity(t *testing.T) {
 }
 
 // 约束（ADR-0003）：取消风暴下 Item 全部保留执行、批次不变形，
-// 且 pending 全量清算（queue_depth 归零——接收侧记账回归钉子）。
+// 且准入额度全量清算（queue_depth 归零——准入口径记账回归钉子）。
 func TestCancelledWaitersStillExecuteAndPendingDrainsToZero(t *testing.T) {
 	m := newFakeMeter()
 	var mu sync.Mutex
@@ -173,9 +173,140 @@ func TestCancelledWaitersStillExecuteAndPendingDrainsToZero(t *testing.T) {
 		t.Fatalf("batch = %d 条（首 %d 末 %d）, want %d 条完整批次", len(got), got[0], got[n-1], n)
 	}
 	if v := m.gauges["batcher_queue_depth"].Value(); v != 0 {
-		t.Fatalf("queue_depth = %v, want 0（pending 全量清算）", v)
+		t.Fatalf("queue_depth = %v, want 0（准入额度全量清算）", v)
 	}
 	if n := len(m.histogram["batcher_wait_seconds"].Values()); n != 20 {
 		t.Fatalf("wait_seconds observations = %d, want 20（取消的 Item 也交付计费）", n)
+	}
+}
+
+// 约束（准入回滚）：停泊在无缓冲握手上的提交被调用方取消时，准入
+// 额度必须回滚——否则额度泄漏会让后续提交在未满载时被误卸载。
+func TestCancelledWhileParkedReleasesAdmissionQuota(t *testing.T) {
+	m := newFakeMeter()
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		entered <- struct{}{}
+		<-release
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+		batcher.WithMaxPending(2),
+		batcher.WithMeter(m),
+	)
+
+	d1 := make(chan int, 1)
+	go func() {
+		res, err := b.Do(context.Background(), 1)
+		if err != nil {
+			t.Errorf("Do(1): %v", err)
+		}
+		d1 <- res
+	}()
+	<-entered // D1 在途：额度 1/2，dispatcher 忙于批次函数，inbox 无人接收
+
+	ctx, cancel := context.WithCancel(context.Background())
+	parked := make(chan error, 1)
+	go func() {
+		_, err := b.Do(ctx, 2)
+		parked <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // D2 已准入、停泊在握手上：额度 2/2
+	cancel()
+	if err := <-parked; !errors.Is(err, context.Canceled) {
+		t.Fatalf("parked Do err = %v, want context.Canceled", err)
+	}
+
+	// 额度须已回滚至 1/2：D3 可准入（回滚缺失则此处被误卸载）。
+	d3 := make(chan int, 1)
+	go func() {
+		res, err := b.Do(context.Background(), 3)
+		if err != nil {
+			t.Errorf("Do(3): %v", err)
+			d3 <- -1
+			return
+		}
+		d3 <- res
+	}()
+
+	close(release) // D1、D3 依次成批执行并交付
+	if res := <-d1; res != 1 {
+		t.Fatalf("Do(1) = %d, want 1", res)
+	}
+	if res := <-d3; res != 3 {
+		t.Fatalf("Do(3) = %d, want 3", res)
+	}
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if v := m.gauges["batcher_queue_depth"].Value(); v != 0 {
+		t.Fatalf("queue_depth = %v, want 0（取消与交付路径额度均清算）", v)
+	}
+}
+
+// 约束（准入口径 gauge）：queue_depth 含停泊在握手上的发送方——
+// 首批阻塞在批次函数内、另两条停泊时，首批批边界必报 2（在途 1
+// 已交付递减 + 停泊 2）。接收侧口径对这部分积压构造性失明，恒报 0。
+func TestQueueDepthGaugeIncludesParkedSenders(t *testing.T) {
+	m := newFakeMeter()
+	entered := make(chan struct{}, 3)
+	release := make(chan struct{})
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		entered <- struct{}{}
+		<-release
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+		batcher.WithMaxPending(3),
+		batcher.WithMeter(m),
+	)
+
+	d1 := make(chan int, 1)
+	go func() {
+		res, err := b.Do(context.Background(), 1)
+		if err != nil {
+			t.Errorf("Do(1): %v", err)
+		}
+		d1 <- res
+	}()
+	<-entered // D1 在途且阻塞在批次函数内：首批批边界的 gauge 尚未刷新
+
+	parked := make(chan int, 2)
+	for _, id := range []int{2, 3} {
+		go func(id int) {
+			res, err := b.Do(context.Background(), id)
+			if err != nil {
+				t.Errorf("Do(%d): %v", id, err)
+			}
+			parked <- res
+		}(id)
+	}
+	time.Sleep(50 * time.Millisecond) // D2、D3 已准入、停泊在握手上
+
+	close(release) // D1 交付递减后批边界 Set(2)；停泊两条串行执行 → Set(1)、Set(0)
+	if res := <-d1; res != 1 {
+		t.Fatalf("Do(1) = %d, want 1", res)
+	}
+	// 先停泊者先交付，但两条 goroutine 的调度顺序不定，按集合断言。
+	parkedGot := []int{<-parked, <-parked}
+	sort.Ints(parkedGot)
+	if parkedGot[0] != 2 || parkedGot[1] != 3 {
+		t.Fatalf("parked results = %v, want [2 3]", parkedGot)
+	}
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 串行单在途：三个批边界按序 2 → 1 → 0，停泊发送方计入 gauge。
+	got := m.gauges["batcher_queue_depth"].History()
+	if fmt.Sprint(got) != "[2 1 0]" {
+		t.Fatalf("queue_depth history = %v, want [2 1 0]（停泊发送方计入 gauge）", got)
 	}
 }

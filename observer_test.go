@@ -58,24 +58,31 @@ func (c *fakeCounter) Value() float64 {
 }
 
 type fakeGauge struct {
-	mu sync.Mutex
-	v  float64
+	mu      sync.Mutex
+	v       float64
+	history []float64
 }
 
 func (g *fakeGauge) Set(v float64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.v = v
+	g.history = append(g.history, v)
+}
+func (g *fakeGauge) Value() float64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.v
 }
 func (g *fakeGauge) Add(v float64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.v += v
 }
-func (g *fakeGauge) Value() float64 {
+func (g *fakeGauge) History() []float64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.v
+	return append([]float64(nil), g.history...)
 }
 
 type fakeHistogram struct {

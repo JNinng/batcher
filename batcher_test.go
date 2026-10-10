@@ -598,3 +598,131 @@ func TestSlowBatchDoesNotCompensateTimerByArrival(t *testing.T) {
 		t.Fatalf("second batch started %v after first finished, want >= ~100ms（组批起算，不补偿）", gap)
 	}
 }
+
+// WithMaxPending：额度满员时新 Do 立即 ErrOverloaded；交付释放额度后
+// 恢复准入，被卸载的调用不占用批次、不影响在途批交付。
+func TestMaxPendingShedsWhenFull(t *testing.T) {
+	m := newFakeMeter()
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		entered <- struct{}{}
+		<-release
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+		batcher.WithMaxPending(2),
+		batcher.WithMeter(m),
+	)
+
+	d1 := make(chan int, 1)
+	go func() {
+		res, err := b.Do(context.Background(), 1)
+		if err != nil {
+			t.Errorf("Do(1): %v", err)
+		}
+		d1 <- res
+	}()
+	<-entered // D1 在途：额度 1/2
+
+	d2 := make(chan int, 1)
+	go func() {
+		res, err := b.Do(context.Background(), 2)
+		if err != nil {
+			t.Errorf("Do(2): %v", err)
+		}
+		d2 <- res
+	}()
+	time.Sleep(50 * time.Millisecond) // D2 已准入、停泊在握手上：额度 2/2
+
+	for _, id := range []int{3, 4} {
+		res, err := b.Do(context.Background(), id)
+		if !errors.Is(err, batcher.ErrOverloaded) {
+			t.Fatalf("Do(%d) = (%d, %v), want ErrOverloaded", id, res, err)
+		}
+		if res != 0 {
+			t.Fatalf("Do(%d) res = %d, want zero value", id, res)
+		}
+	}
+
+	close(release) // D1 交付释放额度，D2 随即入批执行
+	if res := <-d1; res != 1 {
+		t.Fatalf("Do(1) = %d, want 1", res)
+	}
+	if res := <-d2; res != 2 {
+		t.Fatalf("Do(2) = %d, want 2", res)
+	}
+
+	// 额度已释放：新提交恢复准入。
+	if res, err := b.Do(context.Background(), 5); err != nil || res != 5 {
+		t.Fatalf("Do(5) = (%d, %v), want (5, nil)", res, err)
+	}
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if v := m.counters["batcher_overloaded_total"].Value(); v != 2 {
+		t.Fatalf("batcher_overloaded_total = %v, want 2", v)
+	}
+	if v := m.gauges["batcher_queue_depth"].Value(); v != 0 {
+		t.Fatalf("queue_depth = %v, want 0（额度全量释放）", v)
+	}
+}
+
+// 并发风暴：软上限下每个 Do 必以「正确结果 / ErrOverloaded」收场，
+// 绝不悬挂；卸载计数与实际拒绝数一致；额度最终全量释放。
+func TestMaxPendingConcurrentSheddingStorm(t *testing.T) {
+	m := newFakeMeter()
+	release := make(chan struct{})
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		<-release // 首批阻塞在批次函数里，制造卸载窗口
+		return append([]int(nil), reqs...), nil
+	}
+
+	const maxPending = 5
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(maxPending), // 满 5 条按 size 立即成批，不等 interval
+		batcher.WithInterval(10*time.Second),
+		batcher.WithMaxPending(maxPending),
+		batcher.WithMeter(m),
+	)
+
+	const n = 50
+	outcomes := make(chan error, n)
+	releaseGo := launchTogether(n, func(i int) {
+		res, err := b.Do(context.Background(), i+1)
+		if err == nil && res != i+1 {
+			t.Errorf("Do(%d) = %d", i+1, res)
+		}
+		outcomes <- err
+	})
+	releaseGo()
+	time.Sleep(200 * time.Millisecond) // 首批满员进入批次函数（阻塞），其余全部被卸载
+	close(release)
+
+	okCount := 0
+	for i := 0; i < n; i++ {
+		err := <-outcomes
+		switch {
+		case err == nil:
+			okCount++
+		case errors.Is(err, batcher.ErrOverloaded):
+		default:
+			t.Fatalf("越界错误: %v", err)
+		}
+	}
+	if okCount < maxPending {
+		t.Fatalf("ok = %d, want >= %d（首批必须成批进入批次函数）", okCount, maxPending)
+	}
+	if v := m.counters["batcher_overloaded_total"].Value(); v != float64(n-okCount) {
+		t.Fatalf("batcher_overloaded_total = %v, want %d（与实际拒绝数一致）", v, n-okCount)
+	}
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if v := m.gauges["batcher_queue_depth"].Value(); v != 0 {
+		t.Fatalf("queue_depth = %v, want 0（额度全量释放）", v)
+	}
+}

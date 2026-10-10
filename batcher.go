@@ -6,6 +6,8 @@
 //   - Flush 触发条件为批大小上限或时间间隔（自组批起算），先到先触发，
 //     且仅有数据才实际触发——批次函数永远不会收到空切片；
 //   - 同一时刻至多一个 In-flight Batch，下游并发恒为 1；
+//   - 准入可有界（WithMaxPending）：已准入未交付的提交数达上限即负载
+//     卸载，新 Do 立即返回 ErrOverloaded，避免 goroutine 无界堆积；
 //   - 批级错误（含批次函数 panic 降级）广播给该批全部 Waiter，不重试；
 //   - 调用方取消仅解除自身等待，Item 保留照常执行；
 //   - 批次函数运行于 batcher 级基础 ctx；Close 正常返回即全部已入队
@@ -31,6 +33,10 @@ type BatchFunc[Req, Res any] func(ctx context.Context, reqs []Req) ([]Res, error
 // ErrClosed 表示 Close 已开始后到达的新 Do 调用。
 var ErrClosed = errors.New("batcher: closed")
 
+// ErrOverloaded 表示负载卸载：WithMaxPending 上限已满，提交被拒绝、
+// 未入队。调用方可退避后重试或直接失败。
+var ErrOverloaded = errors.New("batcher: overloaded")
+
 // result 是单条 Item 的交付载体。
 type result[Res any] struct {
 	res Res
@@ -47,11 +53,12 @@ type item[Req, Res any] struct {
 // Batcher 将零散 Do 扇入为批量调用。构造后即可并发使用 Do；
 // 用毕必须 Close。
 type Batcher[Req, Res any] struct {
-	fn       BatchFunc[Req, Res]
-	maxSize  int
-	interval time.Duration
+	fn         BatchFunc[Req, Res]
+	maxSize    int
+	interval   time.Duration
+	maxPending int // 已准入未交付提交数上限；0 即无界
 
-	inbox    chan *item[Req, Res] // 无缓冲：执行期间新 Item 停靠在此，即待处理积压
+	inbox    chan *item[Req, Res] // 无缓冲：执行期间新 Item 停靠在此；停泊发送方已过准入，计入 admitted
 	closing  chan struct{}        // Close 已开始，新 Do 立即 ErrClosed
 	shutdown chan struct{}        // 唤醒 dispatcher：flush 后退出
 	done     chan struct{}        // dispatcher 已退出
@@ -63,11 +70,18 @@ type Batcher[Req, Res any] struct {
 	observer Observer
 	metrics  *metrics // meter 为 Noop 时为 nil，整体跳过埋点
 	logger   observ.Logger
-	pending  atomic.Int64 // 已接收未完成 Item 数（queue_depth 口径）
+
+	// admitted 记已准入未交付的提交数（准入口径，queue_depth 数据源）：
+	// 提交入口原子加一，拒绝或中途退路（closing / ctx.Done）即回滚，
+	// 握手成功后转由交付侧逐条递减；加一先于信道发送、递减必在其后，
+	// 故恒非负。停泊在无缓冲 inbox 握手上的发送方也计入，queue_depth
+	// 才反映真实积压——接收侧口径（收到才计数）批间恒 ≤ maxSize，
+	// 原理上看不见这部分积压，故 gauge 取准入口径。
+	admitted atomic.Int64
 }
 
 // New 构造 Batcher 并启动 dispatcher。fn 为 nil、MaxSize/Interval
-// 缺失或非正属程序员工错，构造期 panic。
+// 缺失或非正、MaxPending 为负属程序员工错，构造期 panic。
 func New[Req, Res any](fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res] {
 	if fn == nil {
 		panic("batcher: batch function must not be nil")
@@ -81,6 +95,9 @@ func New[Req, Res any](fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res
 	}
 	if cfg.interval <= 0 {
 		panic("batcher: WithInterval is required and must be > 0")
+	}
+	if cfg.maxPending < 0 {
+		panic("batcher: WithMaxPending must not be negative")
 	}
 	if cfg.observer == nil {
 		cfg.observer = NoopObserver
@@ -97,6 +114,7 @@ func New[Req, Res any](fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res
 		fn:         fn,
 		maxSize:    cfg.maxSize,
 		interval:   cfg.interval,
+		maxPending: cfg.maxPending,
 		inbox:      make(chan *item[Req, Res]),
 		closing:    make(chan struct{}),
 		shutdown:   make(chan struct{}),
@@ -120,13 +138,17 @@ func New[Req, Res any](fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res
 
 // Do 提交一条 Item 并阻塞等待自己那份结果。调用方 ctx 只治理本次
 // 等待：取消即返回 ctx.Err()，Item 保留照常执行、结果丢弃。
-// Close 开始后调用返回 ErrClosed。
+// Close 开始后调用返回 ErrClosed；配置 WithMaxPending 且已准入未交付
+// 的提交数达上限时，调用立即返回 ErrOverloaded，不入队。
 func (b *Batcher[Req, Res]) Do(ctx context.Context, req Req) (Res, error) {
 	var zero Res
 	select {
 	case <-b.closing:
 		return zero, ErrClosed
 	default:
+	}
+	if err := b.admit(); err != nil {
+		return zero, err
 	}
 	it := &item[Req, Res]{
 		req:       req,
@@ -136,8 +158,10 @@ func (b *Batcher[Req, Res]) Do(ctx context.Context, req Req) (Res, error) {
 	select {
 	case b.inbox <- it:
 	case <-b.closing:
+		b.admitted.Add(-1) // 中途退路：回滚准入额度
 		return zero, ErrClosed
 	case <-ctx.Done():
+		b.admitted.Add(-1)
 		return zero, ctx.Err()
 	}
 	select {
@@ -146,6 +170,23 @@ func (b *Batcher[Req, Res]) Do(ctx context.Context, req Req) (Res, error) {
 	case <-ctx.Done():
 		return zero, ctx.Err()
 	}
+}
+
+// admit 准入一条提交：计数原子加一后比较自身返回值（Add-then-check，
+// 无 check-then-act 窗口），已准入未交付提交数因此恒不超过 maxPending。
+// 上限的软性仅在于并发竞争下的计数瞬时虚高（其他提交的拒绝尚未
+// 回滚）：额度尚空的提交可能被假阳性提前拒绝，被拒调用方退避重试
+// 即可。fire-and-forget 提交路径（Enqueue）引入时须走同一准入，
+// 计数口径才涵盖全部提交。
+func (b *Batcher[Req, Res]) admit() error {
+	if n := b.admitted.Add(1); b.maxPending > 0 && n > int64(b.maxPending) {
+		b.admitted.Add(-1)
+		if b.metrics != nil {
+			b.metrics.overloadedTotal.Inc()
+		}
+		return ErrOverloaded
+	}
+	return nil
 }
 
 // Close 优雅关闭：立即 flush 未满批并等待在途批次完成；返回 nil 即
@@ -174,9 +215,7 @@ func (b *Batcher[Req, Res]) Close(ctx context.Context) error {
 
 // run 是 dispatcher 主循环：取首条 → 组批 → 执行，串行往复；
 // shutdown 后 drain 全部积压并 flush，仅有数据才执行。
-// pending 记账在接收侧完成（收到即 Add(1)，交付后 Add(-1)）：
-// 无缓冲握手下发送方的增量可能滞后于整批交付，接收侧记账保证
-// 先增后减的顺序，queue_depth 不出现负值。
+// Item 记账在准入口径完成（见 admitted），dispatcher 只在交付时递减。
 func (b *Batcher[Req, Res]) run() {
 	defer b.baseCancel()
 	defer func() {
@@ -188,7 +227,6 @@ func (b *Batcher[Req, Res]) run() {
 		var first *item[Req, Res]
 		select {
 		case first = <-b.inbox:
-			b.pending.Add(1)
 		case <-b.shutdown:
 			batch := b.drain(nil)
 			if len(batch) > 0 {
@@ -222,7 +260,6 @@ func (b *Batcher[Req, Res]) collect(first *item[Req, Res]) []*item[Req, Res] {
 	for len(batch) < b.maxSize {
 		select {
 		case it := <-b.inbox:
-			b.pending.Add(1)
 			batch = append(batch, it)
 		case <-timer.C:
 			return batch
@@ -238,7 +275,6 @@ func (b *Batcher[Req, Res]) drain(batch []*item[Req, Res]) []*item[Req, Res] {
 	for {
 		select {
 		case it := <-b.inbox:
-			b.pending.Add(1)
 			batch = append(batch, it)
 		default:
 			return batch
@@ -270,7 +306,7 @@ func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time
 			r = res[i]
 		}
 		it.resCh <- result[Res]{res: r, err: err}
-		b.pending.Add(-1)
+		b.admitted.Add(-1) // 交付即释放准入额度
 		if b.metrics != nil {
 			b.metrics.waitSeconds.Observe(time.Since(it.arrivedAt).Seconds())
 		}
@@ -283,7 +319,7 @@ func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time
 		if err != nil {
 			b.metrics.batchFailed.Inc()
 		}
-		b.metrics.queueDepth.Set(float64(b.pending.Load()))
+		b.metrics.queueDepth.Set(float64(b.admitted.Load()))
 	}
 	b.emitFlushed(BatchFlushedEvent{
 		Size:            len(batch),

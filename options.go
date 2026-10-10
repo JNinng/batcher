@@ -11,11 +11,12 @@ import (
 type Option func(*config)
 
 type config struct {
-	maxSize  int
-	interval time.Duration
-	observer Observer
-	meter    observ.Meter
-	logger   observ.Logger
+	maxSize    int
+	interval   time.Duration
+	maxPending int
+	observer   Observer
+	meter      observ.Meter
+	logger     observ.Logger
 }
 
 // WithMaxSize 设置批大小上限（Flush 触发条件之一），必须 > 0。
@@ -27,6 +28,18 @@ func WithMaxSize(n int) Option {
 // 尽力而为软上限），必须 > 0。
 func WithInterval(d time.Duration) Option {
 	return func(c *config) { c.interval = d }
+}
+
+// WithMaxPending 设置已准入未交付提交数上限，实施负载卸载：达上限后
+// 新 Do 立即返回 ErrOverloaded，不入队、不堆积 goroutine。准入采用
+// Add-then-check（原子加一后比较自身返回值），已准入未交付提交数恒
+// 不超过 n；上限的软性仅在于并发竞争下的计数瞬时虚高（其他提交的
+// 拒绝尚未回滚），额度尚空的提交可能被假阳性提前拒绝。Formation 与
+// 在途中的 Item 同样占用额度：批次大小恒不超过 n，n < WithMaxSize 时
+// size 触发不可达，Flush 全部退化为 interval 触发。未设置或 0 即无界，
+// 负值属程序员工错（New 构造期 panic）。
+func WithMaxPending(n int) Option {
+	return func(c *config) { c.maxPending = n }
 }
 
 // WithObserver 注入类型化旁路观测接口，默认 Noop。
