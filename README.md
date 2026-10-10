@@ -9,6 +9,7 @@
 - **同步 `Do`，按位置对位**：`Do(ctx, req)` 阻塞直到自己那份结果返回；批次函数返回与入参等长、同序的结果切片，长度不符视为整批失败。
 - **先到先触发**：批大小上限或时间间隔（自组批起算）先到先触发 Flush；仅有数据才触发，批次函数永远不会收到空切片。
 - **串行单在途**：同一时刻至多一个 In-flight Batch，下游并发恒为 1，行为可预测。
+- **有界队列 + 负载卸载**：`WithMaxPending(n)` 限制已准入未交付的提交数（含停泊在握手上的发送方），达上限新 `Do` 立即返回 `ErrOverloaded`，避免 goroutine 无界堆积。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝。
 - **批级错误广播**：批次函数返回的非 nil 错误（含 panic 经 recover 转化）广播给该批全部 Waiter，不重试；库继续可用。
 - **取消不改变批次形状**：调用方取消仅解除自身等待，其 Item 保留照常执行、结果丢弃；批次的 size 与对位绝不因取消而变化。
 - **优雅关闭**：`Close` 立即 flush 未满批并等待在途批次完成，正常返回即全部已入队 Waiter 已被唤醒；幂等、可并发调用。
@@ -72,6 +73,7 @@ go run ./examples/httpserver
 | --- | --- |
 | Flush 触发 | 批大小上限或时间间隔先到先触发；时间间隔自组批起点（第一条 Item 进入空批）起算，是尽力而为的软上限。空批不计时、不唤醒。 |
 | 下游并发 | 恒为 1：批次函数执行期间新 Item 只排队，不产生并发批量调用。 |
+| 负载卸载 | 配置 `WithMaxPending(n)` 后，已准入未交付的提交数达 n 即拒绝：新 `Do` 立即返回 `ErrOverloaded`，不入队。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝（其他提交的拒绝尚未回滚、计数瞬时虚高），被拒调用方可退避重试。Formation 与在途中的 Item 同样占用额度：批次大小恒不超过 n，n < MaxSize 时批大小触发不可达。未配置即无界。 |
 | 批级错误 | 批次函数返回非 nil 错误、panic、或结果长度与请求不符，整批所有 Waiter 收到同一错误，不重试。单条业务失败由你在结果类型中自行表达。 |
 | 调用方取消 | `Do` 的 ctx 取消即返回 `ctx.Err()`，Item 保留在批中照常执行、结果丢弃。批次函数运行于 batcher 级基础 ctx，不携带任何单个调用方的 deadline。 |
 | Close | 先到达的 Do 立即返回 `ErrClosed`；`Close(ctx)` flush 未满批并等待在途批次完成后才返回，ctx 超时仅放弃等待（后台 flush 照常完成），返回 `ctx.Err()`。 |
@@ -82,11 +84,12 @@ go run ./examples/httpserver
 | --- | --- |
 | `WithMaxSize(n)` | **必填**，批大小上限，必须 > 0。 |
 | `WithInterval(d)` | **必填**，组批时间间隔，必须 > 0。 |
+| `WithMaxPending(n)` | 已准入未交付提交数上限（负载卸载），达上限立即返回 `ErrOverloaded`；已准入提交数恒不超过 n，并发竞争下仅可能被假阳性提前拒绝；n < MaxSize 时批大小触发不可达。0 等价未设置（无界）。 |
 | `WithObserver(o)` | 注入 `Observer` 旁路观测，默认 `NoopObserver`。 |
 | `WithMeter(m)` | 注入 `observ.Meter` 指标，默认 Noop。 |
 | `WithLogger(l)` | 注入 `observ.Logger` 日志，未注入时构造期快照默认 Logger。 |
 
-`fn` 为 nil、必填选项缺失或非正属程序员工错，`New` 构造期 panic。
+`fn` 为 nil、必填选项缺失或非正、`MaxPending` 为负属程序员工错，`New` 构造期 panic。
 
 ## 可观测性
 
@@ -100,7 +103,7 @@ type Observer interface {
 }
 ```
 
-**指标**（注入 `observ.Meter` 后启用，命名遵循 `_total` / `_seconds` / `_depth` 约定）：
+**指标**（注入 `observ.Meter` 后启用，命名遵循 `_total` / `_seconds` / `_depth` 约定；Meter 实现不得 panic，库不做 recover）：
 
 | 指标 | 类型 | 含义 |
 | --- | --- | --- |
@@ -109,7 +112,8 @@ type Observer interface {
 | `batcher_wait_seconds` | Histogram | 单条 Item 从入队到结果交付的端到端等待 |
 | `batcher_batch_size` | Histogram | 每批 Item 数量 |
 | `batcher_batch_duration_seconds` | Histogram | 批次函数执行耗时 |
-| `batcher_queue_depth` | Gauge | 已接收未完成的 Item 数（批边界刷新） |
+| `batcher_queue_depth` | Gauge | 已准入未交付的提交数，含停泊在握手的发送方（批边界刷新） |
+| `batcher_overloaded_total` | Counter | 被 `WithMaxPending` 卸载拒绝的提交数 |
 
 ## 设计文档
 

@@ -34,3 +34,7 @@ _Avoid_: partial error
 
 **In-flight Batch**:
 已 Flush、批次函数尚未返回的 Batch；同一时刻至多一个。
+
+**Admission**:
+提交进入 batcher 的守门动作：入口计数加一计入「已准入未交付」，超过 `WithMaxPending` 上限即拒绝并返回 `ErrOverloaded`（负载卸载），交付时释放额度。已准入提交数恒不超过上限；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝（其他提交的拒绝尚未回滚、计数瞬时虚高）。
+_Avoid_: rate limit（不限速率，只限同时在库提交数）、throttle、backpressure
