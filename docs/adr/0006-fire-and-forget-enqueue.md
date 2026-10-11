@@ -8,8 +8,8 @@ ADR-0001 曾明确「需要 fire-and-forget 的用户需自行包装，库不为
 
 - 写路径与读路径共享同一 Batcher、同一套组批与观测口径；`wait_seconds` 对 Enqueue 条目同样计费，含义为「入队 → 下游写出」的批量延迟。
 - 回调无 ctx 参数：交付点的 caller ctx 已无意义（提交早已返回），需要取消语义的写出应在批次函数内取用 batcher 级基础 ctx。
-- 回调（与 Observer 同款）不得同步再入本 Batcher：回调运行于 dispatcher goroutine，再入的 Do/Enqueue 会停泊在握手上门等同一个正在执行回调的 dispatcher，自死锁；需再入时先转到自有 goroutine 或队列再提交。
-- Enqueue 条目仍分配缓冲交付通道（统一交付路径的代价，结果投递后随 Item 一起回收）；若 P2 Benchmark 显示高吞吐写路径下该分配显著，可改为 nil resCh + 交付侧分支的局部优化，不改契约。
+- 回调（与 Observer 同款）不得同步再入本 Batcher：回调运行于执行 goroutine，再入的 Do/Enqueue 需等槽位而槽位正被本回调所在批占用——下游并发 1 下自死锁，>1 下阻塞所在批的剩余交付；需再入时先转到自有 goroutine 或队列再提交。
+- Enqueue 条目仍分配缓冲交付通道（统一交付路径的代价，结果投递后随 Item 一起回收）；若后续 Benchmark 显示高吞吐写路径下该分配显著，可改为 nil resCh + 交付侧分支的局部优化，不改契约。
 - 回调在交付循环内逐条执行，慢回调会拉长整批交付——契约写明微秒级返回，不做超时治理（与 Observer 同策）。
 - 未来 OnItemDiscarded hook 须排除 Enqueue 来源 Item——fire-and-forget 本就无人读取，无差别定义会全量误报（届时 item 需携带来源标记）。
-- 按字节攒批（`WithMaxBytes`，P1 待定决策）落地后与 Enqueue 组合覆盖高吞吐写出场景。
+- 按字节攒批（`WithMaxBytes`，[0007](0007-max-bytes-batching.md)）与 Enqueue 组合覆盖高吞吐写出场景。

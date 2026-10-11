@@ -6,8 +6,8 @@ import "github.com/jninng/observ"
 // （计数器带 _total、耗时带 _seconds、状态量带 _depth）。
 // 核心包只有无 label 指标；带 label 聚合由用户侧 adapter 完成。
 // Meter 实现不得 panic（库不 recover Meter 回调，与 Observer 契约不同）
-// 且必须并发安全：WithMaxConcurrency(n>1) 下埋点从多个执行 goroutine
-// 并发发生（提交方 goroutine 上另有 admit/拒绝计数）。
+// 且必须并发安全：WithMaxConcurrency(n>1) 或路由层分片下埋点从多个
+// goroutine 并发发生（提交方 goroutine 上另有 admit/拒绝计数）。
 type metrics struct {
 	batchTotal      observ.Counter
 	batchFailed     observ.Counter

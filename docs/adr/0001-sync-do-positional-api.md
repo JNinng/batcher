@@ -7,4 +7,4 @@ v1 API 只提供同步的 `Do(ctx, req) (res, error)`，每个调用方阻塞等
 ## Consequences
 
 - 库不猜测下游批量接口的部分失败语义，只守"长度契约 + 广播"这一条。
-- 需要 fire-and-forget 的用户需自行包装，库不为它增加第二条提交路径。
+- 需要 fire-and-forget 的用户需自行包装，库不为它增加第二条提交路径。（已由 [0006](0006-fire-and-forget-enqueue.md) 翻转：`Enqueue`/`EnqueueFunc` 即第二条提交路径。）
