@@ -120,3 +120,52 @@ func ExampleNewKeyed() {
 	// user-7
 	// batch fn calls: 1
 }
+
+// ExampleNewKeyedMap 展示 keyed-map 变体：批次函数返回 map[K]Res，
+// 缺 key 转为单条 ErrMissingResult、不构成整批失败。
+func ExampleNewKeyedMap() {
+	// 模拟下游 mget：id 7 缺失。
+	mget := func(ctx context.Context, ids []int) (map[int]string, error) {
+		m := make(map[int]string, len(ids))
+		for _, id := range ids {
+			if id == 7 {
+				continue
+			}
+			m[id] = fmt.Sprintf("user-%d", id)
+		}
+		return m, nil
+	}
+
+	b := batcher.NewKeyedMap(func(id int) int { return id }, mget,
+		batcher.WithMaxSize(3),
+		batcher.WithInterval(50*time.Millisecond),
+	)
+	defer b.Close(context.Background())
+
+	// 3 个并发请求中 2 个是同一 id（去重后 2 条 unique），id 7 缺失。
+	ids := []int{42, 42, 7}
+	results := make([]batcher.Result[string], len(ids))
+	var wg sync.WaitGroup
+	wg.Add(len(ids))
+	release := launchTogether(len(ids), func(i int) {
+		defer wg.Done()
+		r, err := b.Do(context.Background(), ids[i])
+		if err != nil {
+			panic(err)
+		}
+		results[i] = r
+	})
+	release() // 屏障确保三条请求同批到达
+	wg.Wait()
+	for _, r := range results {
+		if r.Err != nil {
+			fmt.Println("missing:", r.Err)
+			continue
+		}
+		fmt.Println(r.Value)
+	}
+	// Output:
+	// user-42
+	// user-42
+	// missing: batcher: missing result
+}

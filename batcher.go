@@ -11,6 +11,9 @@
 //   - 批内可按 key 去重（NewKeyed）：批次函数收到去重切片，同 key 的
 //     Waiter 共享同一条执行；折叠发生在交付边界，重复 Item 照常占槽
 //     触发 Flush；
+//   - 逐条业务失败由 Result{Value, Err} 承载（New 下以 Result 作 Res、
+//     NewKeyedMap 下缺 key 即 Result{Err: ErrMissingResult}），与批级
+//     错误广播正交；
 //   - 批级错误（含批次函数 panic 降级）广播给该批全部 Waiter，不重试；
 //   - 调用方取消仅解除自身等待，Item 保留照常执行；
 //   - 批次函数运行于 batcher 级基础 ctx；Close 正常返回即全部已入队
@@ -40,8 +43,8 @@ var ErrClosed = errors.New("batcher: closed")
 // 未入队。调用方可退避后重试或直接失败。
 var ErrOverloaded = errors.New("batcher: overloaded")
 
-// result 是单条 Item 的交付载体。
-type result[Res any] struct {
+// delivery 是单条 Item 的交付载体。
+type delivery[Res any] struct {
 	res Res
 	err error
 }
@@ -50,7 +53,7 @@ type result[Res any] struct {
 type item[Req, Res any] struct {
 	req       Req
 	arrivedAt time.Time
-	resCh     chan result[Res]
+	resCh     chan delivery[Res]
 }
 
 // foldFunc 把原始批折叠为按 key 去重的切片（保持首次出现序），连同
@@ -232,7 +235,7 @@ func (b *Batcher[Req, Res]) Do(ctx context.Context, req Req) (Res, error) {
 	it := &item[Req, Res]{
 		req:       req,
 		arrivedAt: time.Now(),
-		resCh:     make(chan result[Res], 1),
+		resCh:     make(chan delivery[Res], 1),
 	}
 	select {
 	case b.inbox <- it:
@@ -379,7 +382,7 @@ func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time
 		if err == nil {
 			r = res[i]
 		}
-		it.resCh <- result[Res]{res: r, err: err}
+		it.resCh <- delivery[Res]{res: r, err: err}
 		b.admitted.Add(-1) // 交付即释放准入额度
 		if b.metrics != nil {
 			b.metrics.waitSeconds.Observe(time.Since(it.arrivedAt).Seconds())
