@@ -4,7 +4,9 @@ import "time"
 
 // Observer 是 batcher 的类型化旁路观测接口（默认 Noop）。
 // 回调在派发 goroutine 同步执行，必须快速返回（微秒级）；
-// 回调 panic 会被库 recover，观测不得改变业务执行语义。
+// 回调 panic 会被库 recover，观测不得改变业务执行语义；
+// 回调内不得同步再入本 Batcher——再入提交会停泊在同一 dispatcher
+// 的握手上，自死锁。
 type Observer interface {
 	// OnCreated 在 New 返回前于构造方 goroutine 触发一次。
 	OnCreated(CreatedEvent)

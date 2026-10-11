@@ -46,3 +46,7 @@ _Avoid_: merge、collapse、singleflight（实现手法名）
 **Result**:
 逐条业务失败的通用表示 `{Value, Err}`：批级失败走 `Do` 返回的 error，逐条失败由 `Result.Err` 承载，结果切片与请求恒等长。库不解读 Result，批次仍整批成败；`NewKeyedMap` 下缺 key 即 `Result{Err: ErrMissingResult}`。
 _Avoid_: per-item error、partial error
+
+**Enqueue**:
+fire-and-forget 提交路径：不等待结果，ctx 只治理本次提交（准入与入队握手）；Item 与 Do 来源一视同仁地组批执行，结果无人读取（`EnqueueFunc` 可在交付点旁路回调）。
+_Avoid_: submit、post、async do、send

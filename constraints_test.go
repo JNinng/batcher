@@ -310,3 +310,78 @@ func TestQueueDepthGaugeIncludesParkedSenders(t *testing.T) {
 		t.Fatalf("queue_depth history = %v, want [2 1 0]（停泊发送方计入 gauge）", got)
 	}
 }
+
+// 约束（Enqueue 停泊取消）：停泊在握手上的 fire-and-forget 提交被取消
+// 时，额度必须回滚、Item 不入队——批次函数收不到该条。
+func TestEnqueueCancelledWhileParkedNeverReachesFn(t *testing.T) {
+	var mu sync.Mutex
+	var calls [][]int
+	entered := make(chan struct{}, 2) // fn 被调两次（D1、E3），缓冲须容纳
+	release := make(chan struct{})
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		mu.Lock()
+		calls = append(calls, append([]int(nil), reqs...))
+		mu.Unlock()
+		entered <- struct{}{}
+		<-release
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+		batcher.WithMaxPending(2),
+	)
+
+	d1 := make(chan int, 1)
+	go func() {
+		res, err := b.Do(context.Background(), 1)
+		if err != nil {
+			t.Errorf("Do(1): %v", err)
+		}
+		d1 <- res
+	}()
+	<-entered // D1 在途：额度 1/2，dispatcher 忙，inbox 无人接收
+
+	ctx, cancel := context.WithCancel(context.Background())
+	parked := make(chan error, 1)
+	go func() {
+		parked <- b.Enqueue(ctx, 2)
+	}()
+	time.Sleep(50 * time.Millisecond) // E2 已准入、停泊在握手上：额度 2/2
+	cancel()
+	if err := <-parked; !errors.Is(err, context.Canceled) {
+		t.Fatalf("parked Enqueue err = %v, want context.Canceled", err)
+	}
+
+	// 额度须已回滚至 1/2：E3 可准入（回滚缺失则此处被误卸载）。
+	// Enqueue 停泊在握手上不会返回（dispatcher 仍被阻塞的 fn 占用），
+	// 须放 goroutine，主流程才能走 to close(release)。
+	e3 := make(chan error, 1)
+	go func() { e3 <- b.Enqueue(context.Background(), 3) }()
+	time.Sleep(50 * time.Millisecond) // E3 已准入、停泊在握手上
+
+	close(release) // D1 交付；E3 随后成批执行
+	if res := <-d1; res != 1 {
+		t.Fatalf("Do(1) = %d, want 1", res)
+	}
+	if err := <-e3; err != nil {
+		t.Fatalf("Enqueue(3) = %v, want nil", err)
+	}
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, reqs := range calls {
+		for _, r := range reqs {
+			if r == 2 {
+				t.Fatalf("batch 含 2 = %v, want 无（取消的提交不入队）", reqs)
+			}
+		}
+	}
+	if len(calls) == 0 {
+		t.Fatal("fn calls = 0, want >= 1（D1 应已执行）")
+	}
+}

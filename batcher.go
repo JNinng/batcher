@@ -14,6 +14,9 @@
 //   - 逐条业务失败由 Result{Value, Err} 承载（New 下以 Result 作 Res、
 //     NewKeyedMap 下缺 key 即 Result{Err: ErrMissingResult}），与批级
 //     错误广播正交；
+//   - 可 fire-and-forget 入队（Enqueue/EnqueueFunc）：不等待结果、ctx
+//     只治理提交；per-item 回调在交付点同步执行，与 Observer 同款旁路
+//     约束；
 //   - 批级错误（含批次函数 panic 降级）广播给该批全部 Waiter，不重试；
 //   - 调用方取消仅解除自身等待，Item 保留照常执行；
 //   - 批次函数运行于 batcher 级基础 ctx；Close 正常返回即全部已入队
@@ -50,10 +53,12 @@ type delivery[Res any] struct {
 }
 
 // item 是一条已入队的请求及其交付通道（缓冲 1，绝不阻塞派发）。
+// cb 为 fire-and-forget 提交的 per-item 回调，Do 来源恒为 nil。
 type item[Req, Res any] struct {
 	req       Req
 	arrivedAt time.Time
 	resCh     chan delivery[Res]
+	cb        func(res Res, err error)
 }
 
 // foldFunc 把原始批折叠为按 key 去重的切片（保持首次出现序），连同
@@ -218,33 +223,16 @@ func callKey[K comparable, Req any](key func(Req) K, req Req) (k K, err error) {
 	return key(req), nil
 }
 
-// Do 提交一条 Item 并阻塞等待自己那份结果。调用方 ctx 只治理本次
-// 等待：取消即返回 ctx.Err()，Item 保留照常执行、结果丢弃。
+// Do 提交一条 Item 并阻塞等待自己那份结果。调用方 ctx 治理提交与
+// 等待两个阶段：入队握手前取消即返回 ctx.Err()、Item 不入队；已
+// 入队后取消仅解除等待，Item 保留照常执行、结果丢弃。
 // Close 开始后调用返回 ErrClosed；配置 WithMaxPending 且已准入未交付
 // 的提交数达上限时，调用立即返回 ErrOverloaded，不入队。
 func (b *Batcher[Req, Res]) Do(ctx context.Context, req Req) (Res, error) {
 	var zero Res
-	select {
-	case <-b.closing:
-		return zero, ErrClosed
-	default:
-	}
-	if err := b.admit(); err != nil {
+	it, err := b.submit(ctx, req, nil)
+	if err != nil {
 		return zero, err
-	}
-	it := &item[Req, Res]{
-		req:       req,
-		arrivedAt: time.Now(),
-		resCh:     make(chan delivery[Res], 1),
-	}
-	select {
-	case b.inbox <- it:
-	case <-b.closing:
-		b.admitted.Add(-1) // 中途退路：回滚准入额度
-		return zero, ErrClosed
-	case <-ctx.Done():
-		b.admitted.Add(-1)
-		return zero, ctx.Err()
 	}
 	select {
 	case r := <-it.resCh:
@@ -254,12 +242,65 @@ func (b *Batcher[Req, Res]) Do(ctx context.Context, req Req) (Res, error) {
 	}
 }
 
+// Enqueue 提交一条 fire-and-forget Item：不阻塞等待结果，返回 nil 即
+// 已入队，此后不再有取消语义——Item 与 Do 来源一视同仁地组批、执行、
+// 计入观测与准入额度，结果无人读取。ctx 只治理本次提交（准入与入队
+// 握手）：取消即返回 ctx.Err()、Item 不入队；Close 开始后返回
+// ErrClosed；WithMaxPending 满时返回 ErrOverloaded。写路径（日志/
+// 埋点/消息队列 producer）与读路径共享同一 Batcher 与观测口径。
+func (b *Batcher[Req, Res]) Enqueue(ctx context.Context, req Req) error {
+	_, err := b.submit(ctx, req, nil)
+	return err
+}
+
+// EnqueueFunc 在 Enqueue 之上接受 per-item 回调：交付点同步执行，收到
+// 与 Do 相同口径的结果与错误——批级失败即 Batch Error、逐条失败随
+// Res 自行表达。回调必须快速返回（微秒级）、panic 由库 recover（与
+// Observer 同款旁路约束），先于该批的 OnBatchFlushed。回调运行于
+// dispatcher goroutine，不得同步再入本 Batcher——再入提交会停泊在
+// 握手上，等同一个正在执行回调的 dispatcher，自死锁；需再入时先转到
+// 自有 goroutine 或队列。cb 为 nil 等价 Enqueue。
+func (b *Batcher[Req, Res]) EnqueueFunc(ctx context.Context, req Req, cb func(res Res, err error)) error {
+	_, err := b.submit(ctx, req, cb)
+	return err
+}
+
+// submit 是 Do / Enqueue / EnqueueFunc 共用的提交路径：准入、构造
+// Item、入队握手——admit 计数口径因此结构性涵盖全部提交。返回已入队
+// 的 Item 供 Do 继续等待交付；fire-and-forget 调用方直接忽略。
+func (b *Batcher[Req, Res]) submit(ctx context.Context, req Req, cb func(res Res, err error)) (*item[Req, Res], error) {
+	select {
+	case <-b.closing:
+		return nil, ErrClosed
+	default:
+	}
+	if err := b.admit(); err != nil {
+		return nil, err
+	}
+	it := &item[Req, Res]{
+		req:       req,
+		arrivedAt: time.Now(),
+		resCh:     make(chan delivery[Res], 1),
+		cb:        cb,
+	}
+	select {
+	case b.inbox <- it:
+		return it, nil
+	case <-b.closing:
+		b.admitted.Add(-1) // 中途退路：回滚准入额度
+		return nil, ErrClosed
+	case <-ctx.Done():
+		b.admitted.Add(-1)
+		return nil, ctx.Err()
+	}
+}
+
 // admit 准入一条提交：计数原子加一后比较自身返回值（Add-then-check，
 // 无 check-then-act 窗口），已准入未交付提交数因此恒不超过 maxPending。
 // 上限的软性仅在于并发竞争下的计数瞬时虚高（其他提交的拒绝尚未
 // 回滚）：额度尚空的提交可能被假阳性提前拒绝，被拒调用方退避重试
-// 即可。fire-and-forget 提交路径（Enqueue）引入时须走同一准入，
-// 计数口径才涵盖全部提交。
+// 即可。Do / Enqueue / EnqueueFunc 均经 submit 走此路径，计数口径
+// 涵盖全部提交。
 func (b *Batcher[Req, Res]) admit() error {
 	if n := b.admitted.Add(1); b.maxPending > 0 && n > int64(b.maxPending) {
 		b.admitted.Add(-1)
@@ -384,6 +425,9 @@ func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time
 		}
 		it.resCh <- delivery[Res]{res: r, err: err}
 		b.admitted.Add(-1) // 交付即释放准入额度
+		if it.cb != nil {
+			b.safeItemCallback(it.cb, r, err)
+		}
 		if b.metrics != nil {
 			b.metrics.waitSeconds.Observe(time.Since(it.arrivedAt).Seconds())
 		}
@@ -454,6 +498,13 @@ func (b *Batcher[Req, Res]) safeEmit(call func(o Observer)) {
 	}
 	defer func() { _ = recover() }()
 	call(b.observer)
+}
+
+// safeItemCallback 在交付点同步执行 fire-and-forget 的 per-item 回调；
+// panic 一律 recover（与 Observer 同款旁路约束，回调不得改变交付语义）。
+func (b *Batcher[Req, Res]) safeItemCallback(cb func(res Res, err error), res Res, err error) {
+	defer func() { _ = recover() }()
+	cb(res, err)
 }
 
 func (b *Batcher[Req, Res]) emitCreated() {

@@ -169,3 +169,63 @@ func ExampleNewKeyedMap() {
 	// user-42
 	// missing: batcher: missing result
 }
+
+// ExampleBatcher_Enqueue 展示 fire-and-forget 入队：写路径提交即返回，
+// 攒批写出，不等待下游。
+func ExampleBatcher_Enqueue() {
+	flushed := make(chan []string, 1)
+	b := batcher.New[string, struct{}](
+		func(ctx context.Context, lines []string) ([]struct{}, error) {
+			flushed <- append([]string(nil), lines...) // 模拟批量写出
+			return make([]struct{}, len(lines)), nil
+		},
+		batcher.WithMaxSize(10),
+		batcher.WithInterval(10*time.Second),
+	)
+
+	// Enqueue 不等待结果：提交即返回，写路径不被下游耗时阻塞。
+	if err := b.Enqueue(context.Background(), "log-line-1"); err != nil {
+		panic(err)
+	}
+	if err := b.Enqueue(context.Background(), "log-line-2"); err != nil {
+		panic(err)
+	}
+	// Close flush 未满批，保证写出完成后才返回。
+	if err := b.Close(context.Background()); err != nil {
+		panic(err)
+	}
+	fmt.Println(<-flushed)
+	// Output: [log-line-1 log-line-2]
+}
+
+// ExampleBatcher_EnqueueFunc 展示带 per-item 回调的 fire-and-forget：
+// 交付点同步回调结果，批级失败即回调的 err。
+func ExampleBatcher_EnqueueFunc() {
+	b := batcher.New[int, string](
+		func(ctx context.Context, ids []int) ([]string, error) {
+			users := make([]string, len(ids))
+			for i, id := range ids {
+				users[i] = fmt.Sprintf("user-%d", id)
+			}
+			return users, nil
+		},
+		batcher.WithMaxSize(2),
+		batcher.WithInterval(10*time.Second),
+	)
+	defer b.Close(context.Background())
+
+	done := make(chan string, 2)
+	for _, id := range []int{42, 7} {
+		if err := b.EnqueueFunc(context.Background(), id, func(res string, err error) {
+			if err != nil {
+				done <- "failed"
+				return
+			}
+			done <- res
+		}); err != nil {
+			panic(err)
+		}
+	}
+	fmt.Println(<-done, <-done)
+	// Output: user-42 user-7
+}
