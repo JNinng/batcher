@@ -42,3 +42,7 @@ _Avoid_: rate limit（不限速率，只限同时在库提交数）、throttle�
 **Fold**:
 交付边界把批内同 key 的多条 Item 合并为一条执行的动作（`NewKeyed` 启用）：批次函数收到保持首次出现序的去重切片，重复 key 只首达 Req 送达下游，结果回填至全部原始位置。重复 Item 照常占槽触发 Flush，maxSize 按原始条数计数。
 _Avoid_: merge、collapse、singleflight（实现手法名）
+
+**Result**:
+逐条业务失败的通用表示 `{Value, Err}`：批级失败走 `Do` 返回的 error，逐条失败由 `Result.Err` 承载，结果切片与请求恒等长。库不解读 Result，批次仍整批成败；`NewKeyedMap` 下缺 key 即 `Result{Err: ErrMissingResult}`。
+_Avoid_: per-item error、partial error

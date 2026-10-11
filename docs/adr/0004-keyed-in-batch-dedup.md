@@ -7,7 +7,7 @@ ADR-0001 曾明确排除按 key 去重；本决定将其翻转为独立构造器
 ## Consequences
 
 - 普通 `New` 行为不变（不去重），`UniqueSize == Size`；keyed 批的位置对位与长度契约对去重切片成立。
-- 去重切片保持首次出现序，下游可见的请求顺序稳定；结果回填发生在折叠处，key 函数每条原始 Item 恰调一次。
+- 去重切片保持首次出现序，下游可见的请求顺序稳定；结果回填发生在折叠处，key 函数每条原始 Item 恰调一次（`NewKeyedMap` 的回查路径例外：每条 unique 再调一次，见 ADR 0005）。
 - 折叠使批内重复不放大下游负载，但 maxSize 语义（原始条数）与 `batcher_batch_size` 口径保持一致，调参直觉不变。
-- `fn` 返回 `map[K]Res` 的变体（缺 key 转单条错误 `ErrMissingResult`，非整批失败）留待与 P1 逐条结果表示共享同一套 key 映射骨架一并解决。
+- `fn` 返回 `map[K]Res` 的变体已落地为 `NewKeyedMap`（缺 key 转单条错误 `ErrMissingResult`，非整批失败），与 P1 逐条结果表示共享同一套 key 映射骨架，见 ADR 0005。
 - 与分片路由（未来 `NewSharded`）组合的前提「同 key ⇒ 同分片」届时须在契约中写明，否则跨片重复、去重失效。
