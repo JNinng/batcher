@@ -8,7 +8,7 @@
 
 - **同步 `Do`，按位置对位**：`Do(ctx, req)` 阻塞直到自己那份结果返回；批次函数返回与入参等长、同序的结果切片，长度不符视为整批失败。
 - **先到先触发**：批大小上限、批字节上限或时间间隔（自组批起算）先到先触发 Flush；仅有数据才触发，批次函数永远不会收到空切片。
-- **串行单在途**：同一时刻至多一个 In-flight Batch，下游并发恒为 1，行为可预测。
+- **可配置下游并发**：默认串行单在途（下游并发 1，行为可预测）；`WithMaxConcurrency(n)` 放宽至同一时刻至多 n 个批次在途，组批与执行重叠——慢批次不再令后续批次空等，缓解队头阻塞。计数单位是批次而非条目。
 - **有界队列 + 负载卸载**：`WithMaxPending(n)` 限制已准入未交付的提交数（含停泊在握手上的发送方），达上限新 `Do` 立即返回 `ErrOverloaded`，避免 goroutine 无界堆积。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝。
 - **批内 key 去重**：`NewKeyed` 把同 key 的并发请求折叠为一次执行——批次函数收到去重切片（首次出现序），同 key 的 Waiter 共享结果；maxSize 仍按原始条数计数，事件双口径 `Size` / `UniqueSize`。
 - **逐条结果 / 错误**：`Result[Res]{Value, Err}` 让位置对位 API 逐条表达业务失败，结果切片仍等长；`NewKeyedMap` 是 keyed-map 变体，批次函数返回 `map[K]Res`，缺 key 转单条 `ErrMissingResult`、非整批失败。
@@ -75,12 +75,12 @@ go run ./examples/httpserver
 | 语义 | 行为 |
 | --- | --- |
 | Flush 触发 | 批大小上限、批字节上限或时间间隔先到先触发；时间间隔自组批起点（第一条 Item 进入空批）起算，是尽力而为的软上限。空批不计时、不唤醒。字节按原始条目累计，单条即超限自成批大小 1 的孤批——不拆分、不丢弃。 |
-| 下游并发 | 恒为 1：批次函数执行期间新 Item 只排队，不产生并发批量调用。 |
+| 下游并发 | 默认恒为 1（串行单在途）；`WithMaxConcurrency(n)` 放宽至同一时刻批次函数在途（已 Flush 未返回）的批次 ≤ n。组批与执行重叠：批次函数执行期间后续批次照常组批，成批后在执行入口排队等空闲槽位（排队中的批尚未 Flush，不计入 n）；interval 仍自各批组批起点起算，成批先于槽位空出时槽位空出即执行。n>1 时多个执行 goroutine 可并发回调 Observer / per-item 回调，实现必须并发安全、跨批事件顺序不保证。 |
 | 负载卸载 | 配置 `WithMaxPending(n)` 后，已准入未交付的提交数达 n 即拒绝：新 `Do` 立即返回 `ErrOverloaded`，不入队。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝（其他提交的拒绝尚未回滚、计数瞬时虚高），被拒调用方可退避重试。Formation 与在途中的 Item 同样占用额度：批次大小恒不超过 n，n < MaxSize 时批大小触发不可达。未配置即无界。 |
 | 批内去重 | `NewKeyed(key, fn)` 在交付边界折叠同 key Item：批次函数收到去重切片（首次出现序，重复 key 只首达 Req 送达下游），`len(res) == len(unique)`，同 key 的 Waiter 共享同一条执行、各自取得一份结果。「key 相同 ⇒ 语义等价」由 key 函数的提供方声明。maxSize 按原始条数计数，重复照常占槽触发 Flush；跨批去重不做，执行期到达的重复 key 落入下一批重查；key 函数 panic 降级为批级错误、库继续可用。 |
 | 批级错误 | 批次函数返回非 nil 错误、panic、或结果长度与请求不符，整批所有 Waiter 收到同一错误，不重试。单条业务失败见「逐条失败」。 |
 | 逐条失败 | `Result[Res]{Value, Err}` 在位置对位 API 下逐条表达业务失败（结果切片仍等长），库不解读 Result：批级失败看 `Do` 的 error，逐条失败看 `Result.Err`。`NewKeyedMap(key, fn)` 在 NewKeyed 折叠之上回查 `map[K]Res`：缺 key 转 `Result{Err: ErrMissingResult}`（单条缺失，非整批失败），多余 key 忽略；key 函数在折叠与回查各调一次，须为纯函数。 |
-| fire-and-forget | `Enqueue(ctx, req)` 提交即返回（nil = 已入队）：Item 与 `Do` 来源一视同仁地组批、执行、计入观测与准入额度，结果无人读取。ctx 只治理本次提交——取消或 Close 即返回 `ctx.Err()` / `ErrClosed` 且不入队；握手完成后再无取消语义。`EnqueueFunc` 附加 per-item 回调：交付点同步执行（先于该批 `OnBatchFlushed`）、必须快速返回、panic 由库 recover；批级失败回调收到同一 Batch Error，cb 为 nil 等价 `Enqueue`。回调内不得同步再入本 Batcher（dispatcher 串行，再入提交自死锁）。 |
+| fire-and-forget | `Enqueue(ctx, req)` 提交即返回（nil = 已入队）：Item 与 `Do` 来源一视同仁地组批、执行、计入观测与准入额度，结果无人读取。ctx 只治理本次提交——取消或 Close 即返回 `ctx.Err()` / `ErrClosed` 且不入队；握手完成后再无取消语义。`EnqueueFunc` 附加 per-item 回调：交付点同步执行（先于该批 `OnBatchFlushed`）、必须快速返回、panic 由库 recover；批级失败回调收到同一 Batch Error，cb 为 nil 等价 `Enqueue`。回调内不得同步再入本 Batcher（再入提交需等槽位而槽位正被本回调所在批占用，下游并发 1 下自死锁）。 |
 | 调用方取消 | `Do` 的 ctx 取消即返回 `ctx.Err()`：入队握手前取消则 Item 不入队，已入队后取消仅解除等待，Item 保留在批中照常执行、结果丢弃。批次函数运行于 batcher 级基础 ctx，不携带任何单个调用方的 deadline。 |
 | Close | 先到达的 Do 立即返回 `ErrClosed`；`Close(ctx)` flush 未满批并等待在途批次完成后才返回，ctx 超时仅放弃等待（后台 flush 照常完成），返回 `ctx.Err()`。 |
 
@@ -91,26 +91,27 @@ go run ./examples/httpserver
 | `WithMaxSize(n)` | **必填**，批大小上限，必须 > 0。 |
 | `WithInterval(d)` | **必填**，组批时间间隔，必须 > 0。 |
 | `WithMaxPending(n)` | 已准入未交付提交数上限（负载卸载），达上限立即返回 `ErrOverloaded`；已准入提交数恒不超过 n，并发竞争下仅可能被假阳性提前拒绝；n < MaxSize 时批大小触发不可达。0 等价未设置（无界）。 |
+| `WithMaxConcurrency(n)` | 下游并发上限：同一时刻批次函数在途的批次 ≤ n，组批与执行重叠、成批后排队等空闲槽位。计数单位是批次而非条目；未设置或 0 保持串行单在途（1），负值构造期 panic。 |
 | `WithMaxBytes(n, size)` | 批字节上限（Flush 触发条件之三，与条数/时间并列先到先触发），`size func(Req) int` 由你声明条目字节量；按原始条目累计（keyed 批的重复照常计费），单条超限自成孤批。n 必须 > 0，size 的 Req 须与 Batcher 一致，失配构造期 panic；size panic 或返回负数 → 该批整体失败（不调批次函数）。 |
 | `WithObserver(o)` | 注入 `Observer` 旁路观测，默认 `NoopObserver`。 |
 | `WithMeter(m)` | 注入 `observ.Meter` 指标，默认 Noop。 |
 | `WithLogger(l)` | 注入 `observ.Logger` 日志，未注入时构造期快照默认 Logger。 |
 
-`fn` 或 key 函数为 nil、必填选项缺失或非正、`MaxPending` 为负、`MaxBytes` 为负或其 size 函数缺失/与 Req 失配属程序员工错，构造期 panic（`New` / `NewKeyed` / `NewKeyedMap`）。
+`fn` 或 key 函数为 nil、必填选项缺失或非正、`MaxPending` 为负、`MaxConcurrency` 为负、`MaxBytes` 为负或其 size 函数缺失/与 Req 失配属程序员工错，构造期 panic（`New` / `NewKeyed` / `NewKeyedMap`）。
 
 ## 可观测性
 
-**Observer**（类型化旁路事件，回调在派发 goroutine 同步执行，必须快速返回；回调 panic 会被库 recover；回调内不得同步再入本 Batcher）：
+**Observer**（类型化旁路事件，回调同步执行、必须快速返回：`OnBatchFlushed` 在执行 goroutine，`OnClosed` 在全部在途批次完成后的收尾段；`WithMaxConcurrency(n>1)` 下多个执行 goroutine 可并发回调，实现必须并发安全、跨批事件顺序不保证；回调 panic 会被库 recover；回调内不得同步再入本 Batcher）：
 
 ```go
 type Observer interface {
 	OnCreated(CreatedEvent)        // 构造时触发一次
 	OnBatchFlushed(BatchFlushedEvent) // 每批一次：Size / UniqueSize / WaitSeconds / DurationSeconds / Err
-	OnClosed(ClosedEvent)          // dispatcher 退出前触发一次
+	OnClosed(ClosedEvent)          // 全部在途批次完成后触发一次
 }
 ```
 
-**指标**（注入 `observ.Meter` 后启用，命名遵循 `_total` / `_seconds` / `_depth` 约定；Meter 实现不得 panic，库不做 recover）：
+**指标**（注入 `observ.Meter` 后启用，命名遵循 `_total` / `_seconds` / `_depth` 约定；Meter 实现不得 panic（库不做 recover）且必须并发安全——`WithMaxConcurrency(n>1)` 下埋点从多个执行 goroutine 并发发生）：
 
 | 指标 | 类型 | 含义 |
 | --- | --- | --- |
@@ -133,5 +134,6 @@ type Observer interface {
 - [0005 逐条结果表示：Result 与 keyed-map 变体](docs/adr/0005-per-item-result.md)
 - [0006 Fire-and-forget 入队：Enqueue 打开写路径](docs/adr/0006-fire-and-forget-enqueue.md)
 - [0007 按字节攒批：WithMaxBytes 三决策](docs/adr/0007-max-bytes-batching.md)
+- [0008 下游并发上限：WithMaxConcurrency 与组批/执行流水线](docs/adr/0008-max-concurrency.md)
 
-`New` 不做批内去重；`NewKeyed` 提供批内 key 去重，「key 相同 ⇒ 语义等价」由 key 函数声明（ADR 0004）；`NewKeyedMap` 在其上提供 map 回查与逐条缺失表示（ADR 0005）；`Enqueue`/`EnqueueFunc` 提供 fire-and-forget 入队（ADR 0006）。
+`New` 不做批内去重；`NewKeyed` 提供批内 key 去重，「key 相同 ⇒ 语义等价」由 key 函数声明（ADR 0004）；`NewKeyedMap` 在其上提供 map 回查与逐条缺失表示（ADR 0005）；`Enqueue`/`EnqueueFunc` 提供 fire-and-forget 入队（ADR 0006）；`WithMaxConcurrency` 放宽下游并发上限并流水线化组批与执行（ADR 0008）。

@@ -5,15 +5,16 @@ import "github.com/jninng/observ"
 // metrics 汇集全部指标句柄；命名遵循 observ 约定
 // （计数器带 _total、耗时带 _seconds、状态量带 _depth）。
 // 核心包只有无 label 指标；带 label 聚合由用户侧 adapter 完成。
-// Meter 实现不得 panic：库不 recover Meter 回调（与 Observer 契约不同），
-// 回调分布在 dispatcher 与提交方 goroutine 上执行。
+// Meter 实现不得 panic（库不 recover Meter 回调，与 Observer 契约不同）
+// 且必须并发安全：WithMaxConcurrency(n>1) 下埋点从多个执行 goroutine
+// 并发发生（提交方 goroutine 上另有 admit/拒绝计数）。
 type metrics struct {
 	batchTotal      observ.Counter
 	batchFailed     observ.Counter
 	waitSeconds     observ.Histogram // 每条 Item 一次：入队 → 结果交付
 	batchSize       observ.Histogram // 每批一次：批大小
 	durationSeconds observ.Histogram // 每批一次：批次函数执行耗时
-	queueDepth      observ.Gauge     // 已准入未交付的提交数，含停泊在握手的发送方（批边界刷新）
+	queueDepth      observ.Gauge     // 已准入未交付的提交数，含停泊在握手的发送方（批边界刷新；并发交付下采样可能瞬时乱序，批边界自校正）
 	overloadedTotal observ.Counter   // 被 WithMaxPending 卸载拒绝的提交数
 }
 

@@ -6,7 +6,9 @@
 //   - Flush 触发条件为批大小上限、批字节上限（WithMaxBytes）或时间
 //     间隔（自组批起算），先到先触发，且仅有数据才实际触发——批次
 //     函数永远不会收到空切片；
-//   - 同一时刻至多一个 In-flight Batch，下游并发恒为 1；
+//   - 下游并发默认 1（串行单在途），WithMaxConcurrency(n) 放宽至
+//     ≤ n：组批与执行重叠，成批后在执行入口排队等空闲槽位，缓解慢
+//     下游的队头阻塞；
 //   - 准入可有界（WithMaxPending）：已准入未交付的提交数达上限即负载
 //     卸载，新 Do 立即返回 ErrOverloaded，避免 goroutine 无界堆积；
 //   - 批内可按 key 去重（NewKeyed）：批次函数收到去重切片，同 key 的
@@ -67,22 +69,35 @@ type item[Req, Res any] struct {
 // 同 key 的 Item 共享同一条结果。err 非 nil 即整批失败。
 type foldFunc[Req, Res any] func(reqs []Req) (unique []Req, scatter func(res []Res) []Res, err error)
 
+// batchJob 是一次已成批待执行的结算单元：批本体、组批耗时（首条
+// Item 入批 → Flush 触发，在成批处结算，不含槽位排队时间）与组批期
+// 预置失败（sizeFn panic 或负数返回，此时不调批次函数）。
+// flushAndAwait → launch → execute 一路携带。
+type batchJob[Req, Res any] struct {
+	batch       []*item[Req, Res]
+	waitSeconds float64
+	presetErr   error
+}
+
 // Batcher 将零散 Do 扇入为批量调用。构造后即可并发使用 Do；
 // 用毕必须 Close。
 type Batcher[Req, Res any] struct {
-	fn         BatchFunc[Req, Res]
-	maxSize    int
-	interval   time.Duration
-	maxPending int                // 已准入未交付提交数上限；0 即无界
-	fold       foldFunc[Req, Res] // 批内 key 折叠，NewKeyed 注入；New 为 nil
-	maxBytes   int                // 批字节上限；0 即无字节上限
-	sizeFn     func(Req) int      // 条目字节量函数，maxBytes > 0 时必设
+	fn             BatchFunc[Req, Res]
+	maxSize        int
+	interval       time.Duration
+	maxPending     int                // 已准入未交付提交数上限；0 即无界
+	fold           foldFunc[Req, Res] // 批内 key 折叠，NewKeyed 注入；New 为 nil
+	maxBytes       int                // 批字节上限；0 即无字节上限
+	sizeFn         func(Req) int      // 条目字节量函数，maxBytes > 0 时必设
+	maxConcurrency int                // 批次函数在途批次上限（下游并发上限）；恒 ≥ 1
 
-	inbox    chan *item[Req, Res] // 无缓冲：执行期间新 Item 停靠在此；停泊发送方已过准入，计入 admitted
+	inbox    chan *item[Req, Res] // 无缓冲：在途槽位占满期间新 Item 停靠在此；停泊发送方已过准入，计入 admitted
 	closing  chan struct{}        // Close 已开始，新 Do 立即 ErrClosed
 	shutdown chan struct{}        // 唤醒 dispatcher：flush 后退出
-	done     chan struct{}        // dispatcher 已退出
+	done     chan struct{}        // dispatcher 已退出（含全部在途执行完成）
 
+	execSlots  chan struct{}  // 在途槽位计数信号量，容量 = maxConcurrency
+	workers    sync.WaitGroup // 在途执行 goroutine 计数，退出前等待归零
 	closeOnce  sync.Once
 	baseCtx    context.Context // 批次函数运行的 ctx，随 dispatcher 退出而取消
 	baseCancel context.CancelFunc
@@ -101,8 +116,8 @@ type Batcher[Req, Res any] struct {
 }
 
 // New 构造 Batcher 并启动 dispatcher。fn 为 nil、MaxSize/Interval
-// 缺失或非正、MaxPending 为负、MaxBytes 为负或其 size 函数缺失/类型
-// 与 Req 失配属程序员工错，构造期 panic。
+// 缺失或非正、MaxPending 为负、MaxConcurrency 为负、MaxBytes 为负或
+// 其 size 函数缺失/类型与 Req 失配属程序员工错，构造期 panic。
 func New[Req, Res any](fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res] {
 	return newBatcher(fn, nil, opts...)
 }
@@ -141,6 +156,12 @@ func newBatcher[Req, Res any](fn BatchFunc[Req, Res], fold foldFunc[Req, Res], o
 	if cfg.maxPending < 0 {
 		panic("batcher: WithMaxPending must not be negative")
 	}
+	if cfg.maxConcurrency < 0 {
+		panic("batcher: WithMaxConcurrency must not be negative")
+	}
+	if cfg.maxConcurrency == 0 {
+		cfg.maxConcurrency = 1 // 默认串行单在途（ADR-0002 的默认保留）
+	}
 	if cfg.maxBytes < 0 {
 		panic("batcher: WithMaxBytes must not be negative")
 	}
@@ -170,21 +191,23 @@ func newBatcher[Req, Res any](fn BatchFunc[Req, Res], fold foldFunc[Req, Res], o
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Batcher[Req, Res]{
-		fn:         fn,
-		maxSize:    cfg.maxSize,
-		interval:   cfg.interval,
-		maxPending: cfg.maxPending,
-		fold:       fold,
-		maxBytes:   cfg.maxBytes,
-		sizeFn:     sizeFn,
-		inbox:      make(chan *item[Req, Res]),
-		closing:    make(chan struct{}),
-		shutdown:   make(chan struct{}),
-		done:       make(chan struct{}),
-		baseCtx:    ctx,
-		baseCancel: cancel,
-		observer:   cfg.observer,
-		logger:     cfg.logger,
+		fn:             fn,
+		maxSize:        cfg.maxSize,
+		interval:       cfg.interval,
+		maxPending:     cfg.maxPending,
+		fold:           fold,
+		maxBytes:       cfg.maxBytes,
+		sizeFn:         sizeFn,
+		maxConcurrency: cfg.maxConcurrency,
+		inbox:          make(chan *item[Req, Res]),
+		closing:        make(chan struct{}),
+		shutdown:       make(chan struct{}),
+		done:           make(chan struct{}),
+		execSlots:      make(chan struct{}, cfg.maxConcurrency),
+		baseCtx:        ctx,
+		baseCancel:     cancel,
+		observer:       cfg.observer,
+		logger:         cfg.logger,
 	}
 	if cfg.meter != observ.NoopMeter { // NoopMeter 可比较，整体门控
 		b.metrics = newMetrics(cfg.meter)
@@ -238,9 +261,9 @@ func recoverAsBatchError(what string, errp *error) {
 	}
 }
 
-// callKey 调用 key 函数，panic 降级为 Batch Error。折叠运行于
-// dispatcher goroutine 且发生在 callFn 的 recover 域之外，此处不
-// recover 则 panic 打穿 dispatcher、进程崩溃。
+// callKey 调用 key 函数，panic 降级为 Batch Error。折叠运行于执行
+// goroutine 且发生在 callFn 的 recover 域之外，此处不 recover 则
+// panic 打穿执行 goroutine、进程崩溃。
 func callKey[K comparable, Req any](key func(Req) K, req Req) (k K, err error) {
 	defer recoverAsBatchError("key function", &err)
 	return key(req), nil
@@ -279,10 +302,10 @@ func (b *Batcher[Req, Res]) Enqueue(ctx context.Context, req Req) error {
 // EnqueueFunc 在 Enqueue 之上接受 per-item 回调：交付点同步执行，收到
 // 与 Do 相同口径的结果与错误——批级失败即 Batch Error、逐条失败随
 // Res 自行表达。回调必须快速返回（微秒级）、panic 由库 recover（与
-// Observer 同款旁路约束），先于该批的 OnBatchFlushed。回调运行于
-// dispatcher goroutine，不得同步再入本 Batcher——再入提交会停泊在
-// 握手上，等同一个正在执行回调的 dispatcher，自死锁；需再入时先转到
-// 自有 goroutine 或队列。cb 为 nil 等价 Enqueue。
+// Observer 同款旁路约束），先于该批的 OnBatchFlushed。回调运行于执行
+// goroutine，不得同步再入本 Batcher——再入提交需等槽位，而槽位正被
+// 本回调所在批占用：MaxConcurrency=1 下自死锁，>1 下阻塞所在批的剩余
+// 交付；需再入时先转到自有 goroutine 或队列。cb 为 nil 等价 Enqueue。
 func (b *Batcher[Req, Res]) EnqueueFunc(ctx context.Context, req Req, cb func(res Res, err error)) error {
 	_, err := b.submit(ctx, req, cb)
 	return err
@@ -359,9 +382,12 @@ func (b *Batcher[Req, Res]) Close(ctx context.Context) error {
 	}
 }
 
-// run 是 dispatcher 主循环：取首条 → 组批 → 执行，串行往复；
-// shutdown 后 drain 全部积压并 flush，仅有数据才执行。
-// Item 记账在准入口径完成（见 admitted），dispatcher 只在交付时递减。
+// run 是 dispatcher 主循环：取首条 → 组批 → 移交执行，串行往复。
+// 组批（Formation）与执行重叠：移交后立即回到接收侧，下一批的计时器
+// 自其 Formation 起算——哪怕上一批仍在执行；在途槽位占满时 dispatcher
+// 停在移交处（launch 阻塞），此后新 Item 停泊在 inbox 握手上。
+// shutdown 后 drain 全部积压、flush 末批，等待全部在途执行 goroutine
+// 退出。Item 记账在准入口径完成（见 admitted），交付侧逐条递减。
 func (b *Batcher[Req, Res]) run() {
 	defer b.baseCancel()
 	defer func() {
@@ -374,23 +400,50 @@ func (b *Batcher[Req, Res]) run() {
 		select {
 		case first = <-b.inbox:
 		case <-b.shutdown:
-			batch := b.drain(nil)
-			if len(batch) > 0 {
-				b.execute(batch, time.Now(), nil)
-			}
+			b.flushAndAwait(batchJob[Req, Res]{})
 			return
 		}
 		formationStart := time.Now()
 		batch, ferr := b.collect(first)
+		// WaitSeconds 在成批处结算（口径：首条 Item 入批 → Flush 触发），
+		// 槽位排队发生在结算之后，不污染组批耗时。
+		job := batchJob[Req, Res]{
+			batch:       batch,
+			waitSeconds: time.Since(formationStart).Seconds(),
+			presetErr:   ferr,
+		}
 		if b.stopped() {
-			batch = b.drain(batch)
-			if len(batch) > 0 {
-				b.execute(batch, formationStart, ferr)
-			}
+			b.flushAndAwait(job)
 			return
 		}
-		b.execute(batch, formationStart, ferr)
+		b.launch(job)
 	}
+}
+
+// launch 把已成批的批次移交执行 goroutine：先占一个在途槽位再派生
+// goroutine，「已 Flush 未返回」的批次因此恒 ≤ maxConcurrency（下游
+// 并发上限的硬界）。槽位占满时在此阻塞——组批随之暂停，新提交停泊
+// 在 inbox 握手上（与执行期停泊同口径计入准入额度），某批交付并释放
+// 槽位后继续。组批耗时已在成批处结算、随 job 移交，不含槽位排队。
+func (b *Batcher[Req, Res]) launch(job batchJob[Req, Res]) {
+	b.workers.Add(1)
+	b.execSlots <- struct{}{}
+	go func() {
+		defer b.workers.Done()
+		defer func() { <-b.execSlots }() // 交付并释放槽位，唤醒排队的下一批
+		b.execute(job)
+	}()
+}
+
+// flushAndAwait 完成关闭路径的收尾：drain 剩余停靠 Item 并入末批
+// （仅有数据才 flush——关闭 flush 无条件），移交执行后等待全部在途
+// goroutine。返回即全部已入队 Waiter 已被唤醒、批次函数不再运行。
+func (b *Batcher[Req, Res]) flushAndAwait(job batchJob[Req, Res]) {
+	job.batch = b.drain(job.batch)
+	if len(job.batch) > 0 {
+		b.launch(job)
+	}
+	b.workers.Wait()
 }
 
 // collect 自首条 Item 起组批：条数达上限、字节达上限或 interval 到期
@@ -464,23 +517,26 @@ func (b *Batcher[Req, Res]) drain(batch []*item[Req, Res]) []*item[Req, Res] {
 	}
 }
 
-// execute 调用批次函数并按位置交付结果，随后记录观测。
-// formationStart 用于 WaitSeconds（组批耗时）口径；presetErr 非 nil
-// 表示组批阶段已失败（sizeFn panic 或负数返回），整批直接以此错误
-// 交付、不调批次函数（UniqueSize 为 0，与折叠前失败口径一致）。
-func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time.Time, presetErr error) {
+// execute 调用批次函数并按位置交付结果，随后记录观测。运行于执行
+// goroutine（在途槽位持有者），n > 1 时多个批次可并发进入本函数，
+// Observer / per-item 回调随之并发（契约要求并发安全）。
+// job.waitSeconds 为组批耗时口径（首条 Item 入批 → Flush 触发，成批处
+// 结算，不含槽位排队）；job.presetErr 非 nil 表示组批阶段已失败（sizeFn
+// panic 或负数返回），整批直接以此错误交付、不调批次函数（UniqueSize
+// 为 0，与折叠前失败口径一致）。
+func (b *Batcher[Req, Res]) execute(job batchJob[Req, Res]) {
+	batch := job.batch
 	reqs := make([]Req, len(batch))
 	for i, it := range batch {
 		reqs[i] = it.req
 	}
 
-	waitSeconds := time.Since(formationStart).Seconds() // 组批耗时：入批 → Flush 触发
 	started := time.Now()
 	var res []Res
 	var uniqueSize int
 	var err error
-	if presetErr != nil {
-		err = presetErr // 组批阶段已失败：不调批次函数
+	if job.presetErr != nil {
+		err = job.presetErr // 组批阶段已失败：不调批次函数
 	} else {
 		res, uniqueSize, err = b.callBatch(reqs)
 	}
@@ -513,7 +569,7 @@ func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time
 	b.emitFlushed(BatchFlushedEvent{
 		Size:            len(batch),
 		UniqueSize:      uniqueSize,
-		WaitSeconds:     waitSeconds,
+		WaitSeconds:     job.waitSeconds,
 		DurationSeconds: durationSeconds,
 		Err:             err,
 	})

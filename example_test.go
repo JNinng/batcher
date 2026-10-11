@@ -25,6 +25,7 @@ func TestNewPanicsOnInvalidConfiguration(t *testing.T) {
 		{"interval zero", []batcher.Option{batcher.WithMaxSize(1), batcher.WithInterval(0)}},
 		{"interval negative", []batcher.Option{batcher.WithMaxSize(1), batcher.WithInterval(-time.Second)}},
 		{"maxPending negative", []batcher.Option{batcher.WithMaxSize(1), batcher.WithInterval(time.Second), batcher.WithMaxPending(-1)}},
+		{"maxConcurrency negative", []batcher.Option{batcher.WithMaxSize(1), batcher.WithInterval(time.Second), batcher.WithMaxConcurrency(-1)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -428,6 +429,55 @@ func TestFlushEventWaitSecondsSemantics(t *testing.T) {
 			t.Fatalf("WaitSeconds = %v, want >= ~interval（interval 触发）", w)
 		}
 	})
+}
+
+// 约束（ADR-0008）：WaitSeconds 是组批耗时口径（首条 Item 入批 →
+// Flush 触发，成批处结算）——槽位排队不计入。慢批 A 执行期间成批
+// 排队的批 B，其 WaitSeconds 仍 ≈ interval；若改在执行入口结算，会
+// 被等槽时间污染成「组批 + 排队」的端到端值（≈0.4s）。
+func TestWaitSecondsExcludesSlotQueueing(t *testing.T) {
+	obs := &recordingObserver{}
+	var calls atomic.Int64
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		if calls.Add(1) == 1 {
+			time.Sleep(300 * time.Millisecond) // 批 A 慢执行，批 B 成批后排队等槽
+		}
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(2),
+		batcher.WithInterval(100*time.Millisecond),
+		batcher.WithObserver(obs),
+	)
+	defer func() {
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}()
+
+	done := make(chan struct{}, 3)
+	release := launchTogether(2, func(i int) {
+		defer func() { done <- struct{}{} }()
+		_, _ = b.Do(context.Background(), i+1) // 屏障确保同批：size=2 立即触发
+	})
+	release()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		_, _ = b.Do(context.Background(), 3) // 执行期到达，独自成批排队
+	}()
+	<-done
+	<-done
+	<-done // 三条全部交付（批 B 已执行完）
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.flushed) != 2 {
+		t.Fatalf("flushed events = %d, want 2", len(obs.flushed))
+	}
+	if w := obs.flushed[1].WaitSeconds; w < 0.08 || w > 0.25 {
+		t.Fatalf("batch B WaitSeconds = %v, want ≈interval 0.1s（成批处结算，不含槽位排队）", w)
+	}
 }
 
 // seqObserver 按到达顺序记录事件种类。

@@ -182,9 +182,12 @@ func TestCancelledWaitersStillExecuteAndPendingDrainsToZero(t *testing.T) {
 
 // 约束（准入回滚）：停泊在无缓冲握手上的提交被调用方取消时，准入
 // 额度必须回滚——否则额度泄漏会让后续提交在未满载时被误卸载。
+// 停泊窗口为「在途槽位占满、dispatcher 停在执行入口等槽位」
+// （ADR-0008）：需先有一条 Item 入队成批占住第二份额度，第三条提交
+// 才停靠在握手上。
 func TestCancelledWhileParkedReleasesAdmissionQuota(t *testing.T) {
 	m := newFakeMeter()
-	entered := make(chan struct{}, 2)
+	entered := make(chan struct{}, 3)
 	release := make(chan struct{})
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
 		entered <- struct{}{}
@@ -195,7 +198,7 @@ func TestCancelledWhileParkedReleasesAdmissionQuota(t *testing.T) {
 	b := batcher.New[int, int](fn,
 		batcher.WithMaxSize(1),
 		batcher.WithInterval(10*time.Millisecond),
-		batcher.WithMaxPending(2),
+		batcher.WithMaxPending(3),
 		batcher.WithMeter(m),
 	)
 
@@ -207,38 +210,51 @@ func TestCancelledWhileParkedReleasesAdmissionQuota(t *testing.T) {
 		}
 		d1 <- res
 	}()
-	<-entered // D1 在途：额度 1/2，dispatcher 忙于批次函数，inbox 无人接收
+	<-entered // D1 在途：额度 1/3，dispatcher 转入下一批 Formation
+
+	d2 := make(chan int, 1)
+	go func() {
+		res, err := b.Do(context.Background(), 2)
+		if err != nil {
+			t.Errorf("Do(2): %v", err)
+		}
+		d2 <- res
+	}()
+	time.Sleep(50 * time.Millisecond) // D2 已入队成批、在执行入口排队等槽位：额度 2/3
 
 	ctx, cancel := context.WithCancel(context.Background())
 	parked := make(chan error, 1)
 	go func() {
-		_, err := b.Do(ctx, 2)
+		_, err := b.Do(ctx, 3)
 		parked <- err
 	}()
-	time.Sleep(50 * time.Millisecond) // D2 已准入、停泊在握手上：额度 2/2
+	time.Sleep(50 * time.Millisecond) // D3 已准入、停泊在握手上（组批已暂停）：额度 3/3
 	cancel()
 	if err := <-parked; !errors.Is(err, context.Canceled) {
 		t.Fatalf("parked Do err = %v, want context.Canceled", err)
 	}
 
-	// 额度须已回滚至 1/2：D3 可准入（回滚缺失则此处被误卸载）。
-	d3 := make(chan int, 1)
+	// 额度须已回滚至 2/3：D4 可准入（回滚缺失则此处被误卸载）。
+	d4 := make(chan int, 1)
 	go func() {
-		res, err := b.Do(context.Background(), 3)
+		res, err := b.Do(context.Background(), 4)
 		if err != nil {
-			t.Errorf("Do(3): %v", err)
-			d3 <- -1
+			t.Errorf("Do(4): %v", err)
+			d4 <- -1
 			return
 		}
-		d3 <- res
+		d4 <- res
 	}()
 
-	close(release) // D1、D3 依次成批执行并交付
+	close(release) // D1、D2 依次成批执行并交付，D4 随后
 	if res := <-d1; res != 1 {
 		t.Fatalf("Do(1) = %d, want 1", res)
 	}
-	if res := <-d3; res != 3 {
-		t.Fatalf("Do(3) = %d, want 3", res)
+	if res := <-d2; res != 2 {
+		t.Fatalf("Do(2) = %d, want 2", res)
+	}
+	if res := <-d4; res != 4 {
+		t.Fatalf("Do(4) = %d, want 4", res)
 	}
 	if err := b.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -249,8 +265,9 @@ func TestCancelledWhileParkedReleasesAdmissionQuota(t *testing.T) {
 }
 
 // 约束（准入口径 gauge）：queue_depth 含停泊在握手上的发送方——
-// 首批阻塞在批次函数内、另两条停泊时，首批批边界必报 2（在途 1
-// 已交付递减 + 停泊 2）。接收侧口径对这部分积压构造性失明，恒报 0。
+// 首批阻塞在批次函数内、一条入队成批等槽位、一条停泊时，首批批边界
+// 必报 2（在途 1 已交付递减 + 成批 1 + 停泊 1）。接收侧口径对这部分
+// 积压构造性失明，恒报 0。
 func TestQueueDepthGaugeIncludesParkedSenders(t *testing.T) {
 	m := newFakeMeter()
 	entered := make(chan struct{}, 3)
@@ -288,7 +305,7 @@ func TestQueueDepthGaugeIncludesParkedSenders(t *testing.T) {
 			parked <- res
 		}(id)
 	}
-	time.Sleep(50 * time.Millisecond) // D2、D3 已准入、停泊在握手上
+	time.Sleep(50 * time.Millisecond) // D2 入队成批等槽位、D3 停泊在握手上
 
 	close(release) // D1 交付递减后批边界 Set(2)；停泊两条串行执行 → Set(1)、Set(0)
 	if res := <-d1; res != 1 {
@@ -312,11 +329,13 @@ func TestQueueDepthGaugeIncludesParkedSenders(t *testing.T) {
 }
 
 // 约束（Enqueue 停泊取消）：停泊在握手上的 fire-and-forget 提交被取消
-// 时，额度必须回滚、Item 不入队——批次函数收不到该条。
+// 时，额度必须回滚、Item 不入队——批次函数收不到该条。停泊窗口为
+// 「在途槽位占满、dispatcher 停在执行入口等槽位」（ADR-0008）：需先有
+// 一条 Item 入队成批占住第二份额度，第三条提交才停靠在握手上。
 func TestEnqueueCancelledWhileParkedNeverReachesFn(t *testing.T) {
 	var mu sync.Mutex
 	var calls [][]int
-	entered := make(chan struct{}, 2) // fn 被调两次（D1、E3），缓冲须容纳
+	entered := make(chan struct{}, 3) // fn 被调三次（D1、E2、E4），缓冲须容纳
 	release := make(chan struct{})
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
 		mu.Lock()
@@ -330,7 +349,7 @@ func TestEnqueueCancelledWhileParkedNeverReachesFn(t *testing.T) {
 	b := batcher.New[int, int](fn,
 		batcher.WithMaxSize(1),
 		batcher.WithInterval(10*time.Millisecond),
-		batcher.WithMaxPending(2),
+		batcher.WithMaxPending(3),
 	)
 
 	d1 := make(chan int, 1)
@@ -341,32 +360,38 @@ func TestEnqueueCancelledWhileParkedNeverReachesFn(t *testing.T) {
 		}
 		d1 <- res
 	}()
-	<-entered // D1 在途：额度 1/2，dispatcher 忙，inbox 无人接收
+	<-entered // D1 在途：额度 1/3，dispatcher 转入下一批 Formation
+
+	// E2 已入队成批、在执行入口排队等槽位：额度 2/3。握手完成即返回
+	// nil，此后再无取消语义（Item 照常执行）。
+	if err := b.Enqueue(context.Background(), 2); err != nil {
+		t.Fatalf("Enqueue(2): %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	parked := make(chan error, 1)
 	go func() {
-		parked <- b.Enqueue(ctx, 2)
+		parked <- b.Enqueue(ctx, 3)
 	}()
-	time.Sleep(50 * time.Millisecond) // E2 已准入、停泊在握手上：额度 2/2
+	time.Sleep(50 * time.Millisecond) // E3 已准入、停泊在握手上（组批已暂停）：额度 3/3
 	cancel()
 	if err := <-parked; !errors.Is(err, context.Canceled) {
 		t.Fatalf("parked Enqueue err = %v, want context.Canceled", err)
 	}
 
-	// 额度须已回滚至 1/2：E3 可准入（回滚缺失则此处被误卸载）。
-	// Enqueue 停泊在握手上不会返回（dispatcher 仍被阻塞的 fn 占用），
-	// 须放 goroutine，主流程才能走 to close(release)。
-	e3 := make(chan error, 1)
-	go func() { e3 <- b.Enqueue(context.Background(), 3) }()
-	time.Sleep(50 * time.Millisecond) // E3 已准入、停泊在握手上
+	// 额度须已回滚至 2/3：E4 可准入（回滚缺失则此处被误卸载）。
+	// Enqueue 停泊在握手上不会返回（dispatcher 停在执行入口等槽位），
+	// 须放 goroutine，主流程才能走到 close(release)。
+	e4 := make(chan error, 1)
+	go func() { e4 <- b.Enqueue(context.Background(), 4) }()
+	time.Sleep(50 * time.Millisecond) // E4 已准入、停泊在握手上
 
-	close(release) // D1 交付；E3 随后成批执行
+	close(release) // D1、E2 依次成批执行并交付，E4 随后
 	if res := <-d1; res != 1 {
 		t.Fatalf("Do(1) = %d, want 1", res)
 	}
-	if err := <-e3; err != nil {
-		t.Fatalf("Enqueue(3) = %v, want nil", err)
+	if err := <-e4; err != nil {
+		t.Fatalf("Enqueue(4) = %v, want nil", err)
 	}
 	if err := b.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -374,14 +399,14 @@ func TestEnqueueCancelledWhileParkedNeverReachesFn(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
+	if len(calls) != 3 {
+		t.Fatalf("fn calls = %d, want 3（D1、E2、E4 各一批；取消的 E3 不入队）", len(calls))
+	}
 	for _, reqs := range calls {
 		for _, r := range reqs {
-			if r == 2 {
-				t.Fatalf("batch 含 2 = %v, want 无（取消的提交不入队）", reqs)
+			if r == 3 {
+				t.Fatalf("batch 含 3 = %v, want 无（取消的提交不入队）", reqs)
 			}
 		}
-	}
-	if len(calls) == 0 {
-		t.Fatal("fn calls = 0, want >= 1（D1 应已执行）")
 	}
 }

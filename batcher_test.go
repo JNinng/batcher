@@ -541,35 +541,27 @@ func TestSingleInFlightBatch(t *testing.T) {
 	}
 }
 
-// identityFn 是最简单的批次函数：原样返回请求。
-func identityFn(ctx context.Context, reqs []int) ([]int, error) {
-	return append([]int(nil), reqs...), nil
-}
-
-// ADR-0002：计时器自组批起算，慢执行后不按到达时刻补偿——
-// 停泊 Item 等待已久也不会立即触发碎片小批。
-func TestSlowBatchDoesNotCompensateTimerByArrival(t *testing.T) {
-	var mu sync.Mutex
-	callStart := []time.Time{}
-	callEnd := []time.Time{}
-	entered := make(chan struct{}, 2)
+// WithMaxConcurrency：下游并发上限的硬界——同一时刻批次函数在途的
+// 批次 ≤ n，且放宽后多批确实重叠执行（慢批次不再令后续批次空等）。
+func TestMaxConcurrencyCapsDownstreamConcurrency(t *testing.T) {
+	var cur, maxSeen atomic.Int64
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
-		mu.Lock()
-		callStart = append(callStart, time.Now())
-		mu.Unlock()
-		entered <- struct{}{}
-		if len(callStart) == 1 {
-			time.Sleep(300 * time.Millisecond) // 第一批慢执行，期间新 Item 停泊
+		n := cur.Add(1)
+		for {
+			m := maxSeen.Load()
+			if n <= m || maxSeen.CompareAndSwap(m, n) {
+				break
+			}
 		}
-		mu.Lock()
-		callEnd = append(callEnd, time.Now())
-		mu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+		cur.Add(-1)
 		return append([]int(nil), reqs...), nil
 	}
 
 	b := batcher.New[int, int](fn,
-		batcher.WithMaxSize(2), // 前两条按 size 立即 flush，与 interval 无关
-		batcher.WithInterval(100*time.Millisecond),
+		batcher.WithMaxSize(1), // 每条自成一批，纯流水线
+		batcher.WithInterval(5*time.Millisecond),
+		batcher.WithMaxConcurrency(4),
 	)
 	defer func() {
 		if err := b.Close(context.Background()); err != nil {
@@ -577,26 +569,166 @@ func TestSlowBatchDoesNotCompensateTimerByArrival(t *testing.T) {
 		}
 	}()
 
-	release := launchTogether(2, func(i int) {
-		_, _ = b.Do(context.Background(), i+1) // 屏障确保同批：size=2 立即触发
+	const n = 8
+	errs := make(chan error, n)
+	release := launchTogether(n, func(i int) {
+		res, err := b.Do(context.Background(), i+1)
+		if err == nil && res != i+1 {
+			t.Errorf("Do(%d) = %d", i+1, res)
+		}
+		errs <- err
 	})
 	release()
-	<-entered // 第一批已开始慢执行
-
-	go func() { _, _ = b.Do(context.Background(), 3) }() // 慢执行期间停泊
-
-	<-entered                         // 第二批已触发
-	time.Sleep(50 * time.Millisecond) // 等第二批 callEnd 记录
-	mu.Lock()
-	defer mu.Unlock()
-	if len(callStart) != 2 {
-		t.Fatalf("fn calls = %d, want 2", len(callStart))
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("Do: %v", err)
+		}
 	}
-	// 第二批的组批计时器自第一批执行完毕起算，需再等满 interval；
-	// 若按到达时刻补偿（item 3 已等 300ms > interval），则 gap ≈ 0。
-	if gap := callStart[1].Sub(callEnd[0]); gap < 80*time.Millisecond {
-		t.Fatalf("second batch started %v after first finished, want >= ~100ms（组批起算，不补偿）", gap)
+	// 重叠执行（≥2）且恒不越上限（槽位硬界，>4 即实现错误）。
+	if m := maxSeen.Load(); m < 2 || m > 4 {
+		t.Fatalf("max concurrent batch functions = %d, want 2..4", m)
 	}
+}
+
+// WithMaxConcurrency + Close：优雅关闭等待全部在途执行 goroutine——
+// n 批并行在途时 Close 阻塞至全部交付，正常返回即批次函数不再运行。
+func TestMaxConcurrencyCloseWaitsAllInflightWorkers(t *testing.T) {
+	entered := make(chan struct{}, 3)
+	release := make(chan struct{})
+	fn := func(ctx context.Context, reqs []int) ([]int, error) {
+		entered <- struct{}{}
+		<-release
+		return append([]int(nil), reqs...), nil
+	}
+
+	b := batcher.New[int, int](fn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(5*time.Millisecond),
+		batcher.WithMaxConcurrency(3),
+	)
+
+	resCh := make(chan int, 3)
+	for i := 1; i <= 3; i++ {
+		go func(i int) {
+			res, err := b.Do(context.Background(), i)
+			if err != nil {
+				t.Errorf("Do(%d): %v", i, err)
+			}
+			resCh <- res
+		}(i)
+	}
+	<-entered
+	<-entered
+	<-entered // 三批并行在途
+
+	closed := make(chan error, 1)
+	go func() { closed <- b.Close(context.Background()) }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned %v while workers in flight, want blocked", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release) // 放行三批 → 全部交付 → Close 返回
+	if err := <-closed; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	got := []int{<-resCh, <-resCh, <-resCh}
+	sort.Ints(got)
+	if fmt.Sprint(got) != "[1 2 3]" {
+		t.Fatalf("results = %v, want [1 2 3]", got)
+	}
+}
+
+// identityFn 是最简单的批次函数：原样返回请求。
+func identityFn(ctx context.Context, reqs []int) ([]int, error) {
+	return append([]int(nil), reqs...), nil
+}
+
+// ADR-0008：组批（Formation）与执行重叠，执行开始时刻 =
+// max(成批时刻, 槽位空出)。计时器仍自各批 Formation 起算——既不按
+// 到达时刻补偿（ADR-0002 的论证保留），也不被空闲槽位提前。两个
+// 子测试各钉一半：成批早于槽位空出 → 槽位空出即执行；成批晚于槽位
+// 空出 → 等满自身 interval。串行默认（下游并发 1）下钉死该时序。
+func TestNextBatchStartsWhenFlushedAndSlotBothReady(t *testing.T) {
+	const interval = 100 * time.Millisecond
+
+	setup := func(t *testing.T, firstLatency time.Duration) (mu *sync.Mutex, callStart, callEnd *[]time.Time, entered chan struct{}) {
+		t.Helper()
+		mu = &sync.Mutex{}
+		started := []time.Time{}
+		ended := []time.Time{}
+		callStart, callEnd = &started, &ended
+		entered = make(chan struct{}, 2)
+		fn := func(ctx context.Context, reqs []int) ([]int, error) {
+			mu.Lock()
+			*callStart = append(*callStart, time.Now())
+			mu.Unlock()
+			entered <- struct{}{}
+			if len(*callStart) == 1 {
+				time.Sleep(firstLatency) // 第一批执行期间，第二批组批计时照常走
+			}
+			mu.Lock()
+			*callEnd = append(*callEnd, time.Now())
+			mu.Unlock()
+			return append([]int(nil), reqs...), nil
+		}
+
+		b := batcher.New[int, int](fn,
+			batcher.WithMaxSize(2), // 前两条按 size 立即 flush，与 interval 无关
+			batcher.WithInterval(interval),
+		)
+		t.Cleanup(func() {
+			if err := b.Close(context.Background()); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		})
+
+		release := launchTogether(2, func(i int) {
+			_, _ = b.Do(context.Background(), i+1) // 屏障确保同批：size=2 立即触发
+		})
+		release()
+		<-entered // 第一批已开始执行
+
+		go func() { _, _ = b.Do(context.Background(), 3) }() // 执行期到达，独自成批等 interval
+		return mu, callStart, callEnd, entered
+	}
+
+	t.Run("slot-limits-starts-at-release", func(t *testing.T) {
+		// 第一批慢执行（300ms > interval）：第二批在 ~interval 处成批、
+		// 排队等槽位，第一批结束即执行——gap≈0，不追加 interval 等待。
+		// 停泊 Item 在流水线下已成批（计时器执行期间走完），按到达
+		// 时刻补偿无从谈起（ADR-0008）。
+		mu, callStart, callEnd, entered := setup(t, 300*time.Millisecond)
+
+		<-entered                         // 第二批已触发执行
+		time.Sleep(50 * time.Millisecond) // 等第二批 callEnd 记录
+		mu.Lock()
+		defer mu.Unlock()
+		if len(*callStart) != 2 {
+			t.Fatalf("fn calls = %d, want 2", len(*callStart))
+		}
+		if gap := (*callStart)[1].Sub((*callEnd)[0]); gap >= 80*time.Millisecond {
+			t.Fatalf("second batch started %v after first finished, want ≈0（成批先于槽位空出，槽位空出即执行）", gap)
+		}
+	})
+
+	t.Run("flush-limits-waits-own-interval", func(t *testing.T) {
+		// 第一批快执行（30ms < interval）：槽位在 ~30ms 即空出，第二批
+		// 仍要等满自身 interval 才执行——不被空闲槽位提前。
+		mu, callStart, callEnd, entered := setup(t, 30*time.Millisecond)
+
+		<-entered                         // 第二批已触发执行
+		time.Sleep(50 * time.Millisecond) // 等第二批 callEnd 记录
+		mu.Lock()
+		defer mu.Unlock()
+		if len(*callStart) != 2 {
+			t.Fatalf("fn calls = %d, want 2", len(*callStart))
+		}
+		if gap := (*callStart)[1].Sub((*callEnd)[0]); gap < 40*time.Millisecond {
+			t.Fatalf("second batch started %v after first finished, want >= ~interval-30ms（成批晚于槽位空出，等满自身 interval）", gap)
+		}
+	})
 }
 
 // WithMaxPending：额度满员时新 Do 立即 ErrOverloaded；交付释放额度后
@@ -636,7 +768,7 @@ func TestMaxPendingShedsWhenFull(t *testing.T) {
 		}
 		d2 <- res
 	}()
-	time.Sleep(50 * time.Millisecond) // D2 已准入、停泊在握手上：额度 2/2
+	time.Sleep(50 * time.Millisecond) // D2 已准入、入队成批在执行入口排队：额度 2/2
 
 	for _, id := range []int{3, 4} {
 		res, err := b.Do(context.Background(), id)

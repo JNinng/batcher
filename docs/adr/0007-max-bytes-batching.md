@@ -8,6 +8,6 @@
 
 - 触发条件从两条变三条，`WaitSeconds` 口径不变（组批耗时）；`batcher_batch_size` 仍报条数，字节分布暂无指标，调参依据留待可观测性 hook 波次一并评估。
 - 写路径（`Enqueue`）与 `WithMaxBytes` 组合覆盖高吞吐写出场景（ADR-0006 预留）。
-- 未来 `WithInFlight`（P2）落地后字节累计仍发生在 Formation，与执行侧并发正交，无需改动。
+- 字节累计发生在 Formation，与执行侧并发（`WithMaxConcurrency`，[0008](0008-max-concurrency.md)）正交，无需改动。
 - 组批期失败（sizeFn panic / 负数返回）以 ferr 预置整批失败、不调批次函数，UniqueSize 记 0；sizeFn 返回负数与 panic 同路径批级失败（负计费会让字节触发静默失效）。退化竞态：此时恰逢 Close，drain 捞入的条目从未被 size 评估、却随整批收到同一错误——与「整批失败」语义自洽，不单独治理。
 - `WithMaxBytes(n>0, nil)`（含 typed-nil）在构造期显式拒绝：config 只在 size 非 nil 时存储，若只按 `cfg.sizeFn != nil` 校验，该组合会静默通过构造、以每批 nil 调用 panic 的批级错误在运行期暴露。

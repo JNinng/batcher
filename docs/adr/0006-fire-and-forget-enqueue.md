@@ -1,5 +1,7 @@
 # Fire-and-forget 入队：Enqueue 打开写路径
 
+> 状态：部分修订。回调的执行载体由 dispatcher goroutine 变为执行 goroutine，再入禁令的机制描述由 [0008](0008-max-concurrency.md) 更新（槽位占用导致的死锁/交付阻塞）；「不得同步再入本 Batcher」的规则本身不变。
+
 ADR-0001 曾明确「需要 fire-and-forget 的用户需自行包装，库不为它增加第二条提交路径」；本决定翻转为新增 `Enqueue(ctx, req) error` 及带 per-item 回调的 `EnqueueFunc`。动机是写路径场景（日志/埋点/消息队列 producer）：这些流量本就无人读取单条结果，为等结果付出的同步等待纯属浪费，而它们恰恰最需要组批摊薄下游开销。Enqueue 与 Do 共用同一条提交路径（submit：准入 → 构造 Item → 入队握手），admit 计数口径因此结构性涵盖全部提交——queue_depth、overloaded_total 与 `WithMaxPending` 卸载对 Enqueue 一视同仁。ctx 只治理本次提交：取消或 Close 即返回 `ctx.Err()` / `ErrClosed` 且不入队；握手完成即返回 nil，此后不再有取消语义——Item 与 Do 来源一视同仁地组批、执行（ADR-0003 同款：已入队不摘除），结果仍经缓冲交付通道投递后丢弃。`EnqueueFunc` 的回调在交付点同步执行，收到与 Do 相同口径的 (值, 错误)——批级失败即 Batch Error、逐条失败随 Res 自行表达（ADR-0005 届时预留的「逐条口径由 per-item 回调定义」就此落定）；必须快速返回、panic 由库 recover（与 Observer 同款旁路约束），先于该批 `OnBatchFlushed`。
 
 ## Consequences

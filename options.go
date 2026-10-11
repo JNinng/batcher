@@ -12,14 +12,15 @@ import (
 type Option func(*config)
 
 type config struct {
-	maxSize    int
-	interval   time.Duration
-	maxPending int
-	maxBytes   int
-	sizeFn     any // func(Req) int；newBatcher 断言回具体类型
-	observer   Observer
-	meter      observ.Meter
-	logger     observ.Logger
+	maxSize        int
+	interval       time.Duration
+	maxPending     int
+	maxBytes       int
+	sizeFn         any // func(Req) int；newBatcher 断言回具体类型
+	maxConcurrency int
+	observer       Observer
+	meter          observ.Meter
+	logger         observ.Logger
 }
 
 // WithMaxSize 设置批大小上限（Flush 触发条件之一），必须 > 0。
@@ -43,6 +44,18 @@ func WithInterval(d time.Duration) Option {
 // 负值属程序员工错（New 构造期 panic）。
 func WithMaxPending(n int) Option {
 	return func(c *config) { c.maxPending = n }
+}
+
+// WithMaxConcurrency 设置下游并发上限 n：同一时刻批次函数在途（已
+// Flush 未返回）的批次 ≤ n，即下游至多 n 个批量调用并行。计数单位是
+// 批次而非条目——n 批 ≠ n 条，差一个批大小数量级。未设置或 0 保持
+// 串行单在途（n=1）。放宽后组批（Formation）与执行重叠：批次函数
+// 执行期间后续批次照常组批，成批后若在途已满则在执行入口排队等空闲
+// 槽位——排队中的批尚未 Flush，不计入 n；interval 仍自各批 Formation
+// 起算，成批先于槽位空出时槽位空出即执行。并发不改变批次形状与
+// 准入/观测口径；负值属程序员工错（New 构造期 panic）。
+func WithMaxConcurrency(n int) Option {
+	return func(c *config) { c.maxConcurrency = n }
 }
 
 // WithMaxBytes 设置批字节上限与条目字节量函数（Flush 触发条件之三，
