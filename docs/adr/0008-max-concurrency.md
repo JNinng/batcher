@@ -32,4 +32,4 @@ Close 语义保持：`flushRemainder`（drain 并入末批、仅有数据才 flu
 - 与 `WithMaxPending` 组合口径不变：在途批、成批待槽、停泊发送方都占准入额度，批次大小恒 ≤ maxPending；卸载判定不感知并发配置。
 - 与 `WithMaxBytes` 正交（ADR-0007 预留兑现）：字节/条数/时间累计都发生在 Formation，与执行侧并发无关。
 - 调参依据：执行侧瓶颈（提交速率 > batchSize/latency）才受益于调高 n；Formation 受限的流应调 interval/maxSize 而非 n。
-- 批次重试（`WithRetry`，尚未落地）：backoff 原地 sleep 在 n=1 下把队头阻塞放大为全库停摆，Retry 建议搭配 MaxConcurrency ≥ 2——届时文档化该交互。
+- 批次重试（`WithRetry`，[0010](0010-batch-retry.md)）：backoff 原地 sleep 在 n=1 下把队头阻塞放大为全库停摆，Retry 建议搭配 MaxConcurrency ≥ 2——该交互已在 0010 文档化并钉死。

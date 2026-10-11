@@ -4,7 +4,7 @@
 
 ## 决策
 
-一、**独立子包**：组合面 = 组批层形态（New/NewKeyed/NewKeyedMap）× 路由层，泛型组合爆炸留在子包消化，核心包只保留组批层。构造器相应消除 stutter：`NewSharded` → `sharded.New`。返回类型为包装类型 `*Sharded[Req, Res]`，实现与 `*Batcher` 相同的 API 面（Do / Enqueue / EnqueueFunc / Close）——单个 Batcher 只有一个 dispatcher，分片必然是包装类型（组批层构造器返回同一个 `*Batcher`，路由层必然是包装）。
+一、**独立子包**：组合面 = 组批层形态（New/NewKeyed/NewKeyedMap）× 路由层，泛型组合爆炸留在子包消化，核心包只保留组批层。构造器相应消除 stutter：`NewSharded` → `sharded.New`。返回类型为包装类型 `*Sharded[Req, Res]`，实现与 `*Batcher` 相同的 API 面（Do / Enqueue / EnqueueFunc / Close）——单个 Batcher 只有一个 dispatcher，路由层必然是包装（组批层构造器返回同一个 `*Batcher`）。
 
 二、**路由函数直接产出分片下标 [0, n)**：不做 hashFn → K comparable 中间形态（comparable 无法直接映射到下标，二次哈希留给 route 内做）。route 须对同一请求返回稳定下标；越界属程序错误、调用期 panic——route 是逐请求执行的用户代码，无法在构造期校验。
 
