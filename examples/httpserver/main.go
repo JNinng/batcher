@@ -97,7 +97,7 @@ func main() {
 			http.Error(w, "bad id", http.StatusBadRequest)
 			return
 		}
-		res, err := b.Do(r.Context(), id) // 调用方 ctx 只治理本次等待
+		res, err := b.Do(r.Context(), id) // 调用方 ctx 治理本次提交与等待；取消即提前返回
 		if err != nil {                   // 批级失败（下游整体挂掉）才 500
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

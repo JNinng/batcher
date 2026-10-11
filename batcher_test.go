@@ -671,7 +671,7 @@ func TestMaxPendingShedsWhenFull(t *testing.T) {
 	}
 }
 
-// 并发风暴：软上限下每个 Do 必以「正确结果 / ErrOverloaded」收场，
+// 并发风暴：准入上限下每个 Do 必以「正确结果 / ErrOverloaded」收场，
 // 绝不悬挂；卸载计数与实际拒绝数一致；额度最终全量释放。
 func TestMaxPendingConcurrentSheddingStorm(t *testing.T) {
 	m := newFakeMeter()
