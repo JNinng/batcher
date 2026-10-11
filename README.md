@@ -62,7 +62,7 @@ func main() {
 }
 ```
 
-完整可运行示例见 [examples/httpserver](examples/httpserver)——一个把并发 HTTP 单查扇入为下游批量查询的服务，演示两种 Flush 触发与旁路观测：
+完整可运行示例见 [examples/httpserver](examples/httpserver)——一个把并发 HTTP 单查扇入为下游批量查询的服务，演示两种 Flush 触发、热点 key 去重与旁路观测：
 
 ```bash
 go run ./examples/httpserver

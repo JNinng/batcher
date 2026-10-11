@@ -1,6 +1,7 @@
 // Command httpserver 演示 batcher 的典型用法：一个 HTTP 服务把
 // 并发到达的单次查询（GET /user?id=N）扇入为对下游批量查询接口的
-// 一次调用，结果按位置归还各请求。
+// 一次调用，结果按位置归还各请求；并演示批内 key 去重——热点 id
+// 的并发查询在交付边界折叠，下游不再重复查询同一 id。
 //
 // 运行：go run ./examples/httpserver
 package main
@@ -33,8 +34,10 @@ func main() {
 	batchAddr := serve(newBatchService())
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	// 2. Batcher：把零散的单 id 查询扇入为一次批量查询。
-	b := batcher.New[int, user](
+	// 2. Batcher：把零散的单 id 查询扇入为一次批量查询。key 函数声明
+	// 「id 相同 ⇒ 语义等价」：批内重复 id 在交付边界折叠为一条，热点
+	// key 不再重复打下游；无重复时折叠透明，行为同普通 New。
+	b := batcher.NewKeyed(func(id int) int { return id },
 		func(ctx context.Context, ids []int) ([]user, error) {
 			fmt.Printf("[下游] 一次批量查询 ids=%v\n", ids)
 			ss := make([]string, len(ids))
@@ -80,7 +83,7 @@ func main() {
 	})
 	upAddr := serve(upMux)
 
-	// 4. 并发打 10 个单次请求：预期合并为 8+2 两个批次。
+	// 4. 并发打 10 个单次请求（id 互异，去重透明）：预期合并为 8+2 两个批次。
 	fmt.Println("[上游] 并发 10 个单次查询 GET /user?id=1..10")
 	var wg sync.WaitGroup
 	for i := 1; i <= 10; i++ {
@@ -99,6 +102,29 @@ func main() {
 		}(i)
 	}
 	wg.Wait()
+
+	// 5. 热点 key：16 个并发查询全部命中 3 个热点 id。重复 Item 照常
+	// 占槽（maxSize 按原始条数计数），每批 8 条在交付边界折叠为至多
+	// 3 条 unique——下游每批只见到 3 个 id，每个请求仍拿回自己的答案。
+	hot := []int{7, 42, 99}
+	fmt.Printf("[上游] 热点 key：并发 16 个查询，全部命中 id∈%v\n", hot)
+	var hotWg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		hotWg.Add(1)
+		go func(id int) {
+			defer hotWg.Done()
+			resp, err := http.Get(fmt.Sprintf("http://%s/user?id=%d", upAddr, id))
+			if err != nil {
+				log.Printf("id=%d: %v", id, err)
+				return
+			}
+			defer resp.Body.Close()
+			var u user
+			_ = json.NewDecoder(resp.Body).Decode(&u)
+			fmt.Printf("[请求] id=%-2d → %s\n", id, u.Name)
+		}(hot[i%len(hot)])
+	}
+	hotWg.Wait()
 
 	if err := b.Close(ctx); err != nil {
 		log.Fatalf("Close: %v", err)
@@ -148,8 +174,8 @@ func (printObserver) OnCreated(e batcher.CreatedEvent) {
 }
 
 func (printObserver) OnBatchFlushed(e batcher.BatchFlushedEvent) {
-	fmt.Printf("[观测] flush size=%d wait=%.1fms duration=%.1fms err=%v\n",
-		e.Size, e.WaitSeconds*1000, e.DurationSeconds*1000, e.Err)
+	fmt.Printf("[观测] flush size=%d unique=%d wait=%.1fms duration=%.1fms err=%v\n",
+		e.Size, e.UniqueSize, e.WaitSeconds*1000, e.DurationSeconds*1000, e.Err)
 }
 
 func (printObserver) OnClosed(batcher.ClosedEvent) {
