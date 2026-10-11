@@ -29,8 +29,12 @@ _Avoid_: dispatch、fire、commit
 _Avoid_: caller（过于泛化）、consumer
 
 **Batch Error**:
-批次函数返回的非 nil 错误，或其 panic 经 recover 转化的错误；广播给该批全部 Waiter，不重试。单条 Item 的业务失败由用户在结果类型中自行表达，与 Batch Error 无关。
+批次函数返回的非 nil 错误，或其 panic 经 recover 转化的错误；广播给该批全部 Waiter。单条 Item 的业务失败由用户在结果类型中自行表达，与 Batch Error 无关。
 _Avoid_: partial error
+
+**Retry**:
+整批按原 reqs 重执行的动作（`WithRetry(n, backoff)` 启用）：仅批次函数以哨兵 `ErrRetryable` 标记的 Batch Error 触发，至多 n 次，其他错误照常广播；重试与退避在执行 goroutine 持槽进行，keyed 批含折叠（key 函数须为纯函数）。
+_Avoid_: requeue、redrive、resubmit
 
 **In-flight Batch**:
 已 Flush、批次函数尚未返回的 Batch；同一时刻至多 `WithMaxConcurrency(n)` 个（未配置即 1，串行单在途），即下游并发上限。成批后等待空闲槽位的批次尚未 Flush，不计入。

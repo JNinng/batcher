@@ -20,7 +20,9 @@
 //   - 可 fire-and-forget 入队（Enqueue/EnqueueFunc）：不等待结果、ctx
 //     只治理提交；per-item 回调在交付点同步执行，与 Observer 同款旁路
 //     约束；
-//   - 批级错误（含批次函数 panic 降级）广播给该批全部 Waiter，不重试；
+//   - 批级错误（含批次函数 panic 降级）广播给该批全部 Waiter，默认
+//     不重试；WithRetry 下仅 errors.Is(err, ErrRetryable) 的错误按原
+//     批次重试（含退避，持槽进行）；
 //   - 调用方取消仅解除自身等待，Item 保留照常执行；
 //   - 批次函数运行于 batcher 级基础 ctx；Close 正常返回即全部已入队
 //     Waiter 已被唤醒。
@@ -48,6 +50,12 @@ var ErrClosed = errors.New("batcher: closed")
 // ErrOverloaded 表示负载卸载：WithMaxPending 上限已满，提交被拒绝、
 // 未入队。调用方可退避后重试或直接失败。
 var ErrOverloaded = errors.New("batcher: overloaded")
+
+// ErrRetryable 是重试哨兵：批次函数返回 errors.Is(err, ErrRetryable)
+// 的批级错误（如 fmt.Errorf("downstream 503: %w", ErrRetryable)）且
+// 配置了 WithRetry 时，整批按原 reqs 重执行；未配置 WithRetry 或错误
+// 不携带该哨兵时不重试，语义与默认一致。
+var ErrRetryable = errors.New("batcher: retryable")
 
 // delivery 是单条 Item 的交付载体。
 type delivery[Res any] struct {
@@ -85,11 +93,13 @@ type Batcher[Req, Res any] struct {
 	fn             BatchFunc[Req, Res]
 	maxSize        int
 	interval       time.Duration
-	maxPending     int                // 已准入未交付提交数上限；0 即无界
-	fold           foldFunc[Req, Res] // 批内 key 折叠，NewKeyed 注入；New 为 nil
-	maxBytes       int                // 批字节上限；0 即无字节上限
-	sizeFn         func(Req) int      // 条目字节量函数，maxBytes > 0 时必设
-	maxConcurrency int                // 批次函数在途批次上限（下游并发上限）；恒 ≥ 1
+	maxPending     int                             // 已准入未交付提交数上限；0 即无界
+	fold           foldFunc[Req, Res]              // 批内 key 折叠，NewKeyed 注入；New 为 nil
+	maxBytes       int                             // 批字节上限；0 即无字节上限
+	sizeFn         func(Req) int                   // 条目字节量函数，maxBytes > 0 时必设
+	maxConcurrency int                             // 批次函数在途批次上限（下游并发上限）；恒 ≥ 1
+	maxRetries     int                             // 可重试批级错误的整批重试上限；0 即不重试
+	backoffFn      func(attempt int) time.Duration // 第 attempt 次重试前的退避，maxRetries > 0 时必设
 
 	inbox    chan *item[Req, Res] // 无缓冲：在途槽位占满期间新 Item 停靠在此；停泊发送方已过准入，计入 admitted
 	closing  chan struct{}        // Close 已开始，新 Do 立即 ErrClosed
@@ -116,8 +126,9 @@ type Batcher[Req, Res any] struct {
 }
 
 // New 构造 Batcher 并启动 dispatcher。fn 为 nil、MaxSize/Interval
-// 缺失或非正、MaxPending 为负、MaxConcurrency 为负、MaxBytes 为负或
-// 其 size 函数缺失/类型与 Req 失配属程序员工错，构造期 panic。
+// 缺失或非正、MaxPending 为负、MaxConcurrency 为负、MaxRetry 非法
+// （为负、>0 缺其 backoff 或 =0 携带 backoff）、MaxBytes 为负或其
+// size 函数缺失/类型与 Req 失配属程序员工错，构造期 panic。
 func New[Req, Res any](fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res] {
 	return newBatcher(fn, nil, opts...)
 }
@@ -162,6 +173,15 @@ func newBatcher[Req, Res any](fn BatchFunc[Req, Res], fold foldFunc[Req, Res], o
 	if cfg.maxConcurrency == 0 {
 		cfg.maxConcurrency = 1 // 默认串行单在途（ADR-0002 的默认保留）
 	}
+	if cfg.maxRetries < 0 {
+		panic("batcher: WithRetry must not be negative")
+	}
+	if cfg.maxRetries > 0 && cfg.backoffFn == nil {
+		panic("batcher: WithRetry backoff function must not be nil")
+	}
+	if cfg.maxRetries == 0 && cfg.backoffFn != nil {
+		panic("batcher: WithRetry backoff function requires retries > 0")
+	}
 	if cfg.maxBytes < 0 {
 		panic("batcher: WithMaxBytes must not be negative")
 	}
@@ -199,6 +219,8 @@ func newBatcher[Req, Res any](fn BatchFunc[Req, Res], fold foldFunc[Req, Res], o
 		maxBytes:       cfg.maxBytes,
 		sizeFn:         sizeFn,
 		maxConcurrency: cfg.maxConcurrency,
+		maxRetries:     cfg.maxRetries,
+		backoffFn:      cfg.backoffFn,
 		inbox:          make(chan *item[Req, Res]),
 		closing:        make(chan struct{}),
 		shutdown:       make(chan struct{}),
@@ -535,10 +557,25 @@ func (b *Batcher[Req, Res]) execute(job batchJob[Req, Res]) {
 	var res []Res
 	var uniqueSize int
 	var err error
+	var retries int
 	if job.presetErr != nil {
 		err = job.presetErr // 组批阶段已失败：不调批次函数
 	} else {
 		res, uniqueSize, err = b.callBatch(reqs)
+		// 批次级重试：仅哨兵错误按原 reqs 重执行（keyed 批含折叠），
+		// 其他错误照常广播。重试与退避在执行 goroutine 持槽进行，
+		// DurationSeconds / wait_seconds / 在途占用均覆盖全过程。
+		for err != nil && b.maxRetries > 0 && errors.Is(err, ErrRetryable) && retries < b.maxRetries {
+			if berr := b.backoffFor(retries + 1); berr != nil {
+				err = berr // 退避失败替代原错误：批在此终止
+				break
+			}
+			retries++ // 计数在退避结算后：只记实际执行的重试，退避失败不计
+			if b.metrics != nil {
+				b.metrics.batchRetries.Inc()
+			}
+			res, uniqueSize, err = b.callBatch(reqs)
+		}
 	}
 	durationSeconds := time.Since(started).Seconds()
 
@@ -571,8 +608,24 @@ func (b *Batcher[Req, Res]) execute(job batchJob[Req, Res]) {
 		UniqueSize:      uniqueSize,
 		WaitSeconds:     job.waitSeconds,
 		DurationSeconds: durationSeconds,
+		Retries:         retries,
 		Err:             err,
 	})
+}
+
+// backoffFor 结算第 attempt 次重试前的退避（用户函数，attempt 从 1
+// 起）并原地 sleep。运行于执行 goroutine、持槽期间——MaxConcurrency=1
+// 时退避即全库停摆（交互见 WithRetry 文档）。panic 与负数返回同款
+// 降级为批级错误（与 size 函数同款约束：无人 recover 会打穿执行
+// goroutine，负退避是程序错误、须显式暴露）。
+func (b *Batcher[Req, Res]) backoffFor(attempt int) (err error) {
+	defer recoverAsBatchError("backoff function", &err)
+	if d := b.backoffFn(attempt); d > 0 {
+		time.Sleep(d)
+	} else if d < 0 {
+		return fmt.Errorf("batcher: backoff function returned negative duration %v", d)
+	}
+	return nil
 }
 
 // callBatch 执行一批：keyed 批先折叠为去重切片再调用批次函数，结果

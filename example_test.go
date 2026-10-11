@@ -171,6 +171,50 @@ func ExampleNewKeyedMap() {
 	// missing: batcher: missing result
 }
 
+// ExampleWithRetry 展示批次级重试：批次函数以 ErrRetryable
+// 哨兵标记可重试的瞬时故障，整批按原请求重执行直至成功或耗尽。
+func ExampleWithRetry() {
+	var attempts int
+	queryUsers := func(ctx context.Context, ids []int) ([]string, error) {
+		attempts++
+		if attempts == 1 {
+			// 模拟下游瞬时 503：以哨兵标记可重试。
+			return nil, fmt.Errorf("downstream 503: %w", batcher.ErrRetryable)
+		}
+		users := make([]string, len(ids))
+		for i, id := range ids {
+			users[i] = fmt.Sprintf("user-%d", id)
+		}
+		return users, nil
+	}
+
+	b := batcher.New(queryUsers,
+		batcher.WithMaxSize(2),
+		batcher.WithInterval(10*time.Second), // 两条占满即触发
+		batcher.WithRetry(3, func(attempt int) time.Duration {
+			return time.Duration(attempt) * 5 * time.Millisecond // 线性退避
+		}),
+	)
+	defer b.Close(context.Background())
+
+	results := make([]string, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i, id := range []int{42, 7} {
+		go func(i, id int) {
+			defer wg.Done()
+			res, err := b.Do(context.Background(), id)
+			if err != nil {
+				panic(err)
+			}
+			results[i] = res
+		}(i, id)
+	}
+	wg.Wait()
+	fmt.Println(results[0], results[1])
+	// Output: user-42 user-7
+}
+
 // ExampleBatcher_Enqueue 展示 fire-and-forget 入队：写路径提交即返回，
 // 攒批写出，不等待下游。
 func ExampleBatcher_Enqueue() {

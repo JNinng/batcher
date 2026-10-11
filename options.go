@@ -18,6 +18,8 @@ type config struct {
 	maxBytes       int
 	sizeFn         any // func(Req) int；newBatcher 断言回具体类型
 	maxConcurrency int
+	maxRetries     int
+	backoffFn      func(attempt int) time.Duration // 第 attempt 次重试前的退避时长
 	observer       Observer
 	meter          observ.Meter
 	logger         observ.Logger
@@ -56,6 +58,26 @@ func WithMaxPending(n int) Option {
 // 准入/观测口径；负值属程序员工错（New 构造期 panic）。
 func WithMaxConcurrency(n int) Option {
 	return func(c *config) { c.maxConcurrency = n }
+}
+
+// WithRetry 配置批次级重试：批次函数返回 errors.Is(err, ErrRetryable)
+// 的批级错误时，整批按原 reqs 重执行（keyed 批含折叠，key 函数须为
+// 纯函数），至多 n 次；其他错误照常广播——不重试的默认语义不变
+// （未配置本选项时即便错误携带 ErrRetryable 也只执行一次）。
+// backoff 在每次重试前以重试序号调用（首个退避为 1）并原地 sleep；
+// 其 panic 与负数返回降级为批级错误（与 size 函数同款约束）。重试
+// 与退避在执行 goroutine 持槽进行、计入 DurationSeconds 与
+// wait_seconds（端到端等待被拉高属预期）。交互注意：MaxConcurrency=1
+// 时退避把队头阻塞放大为全库停摆，建议搭配 WithMaxConcurrency ≥ 2；
+// 与 WithMaxPending 叠加时退避窗口内新提交可能集中被卸载
+// （ErrOverloaded）。n 必须 ≥ 0（0 即默认不重试，此时 backoff 须为
+// nil）——负值、n > 0 缺失 backoff 或 n = 0 携带 backoff 属程序员
+// 工错，New 构造期 panic（与 WithMaxBytes 的 n/size 配对校验同款）。
+func WithRetry(n int, backoff func(attempt int) time.Duration) Option {
+	return func(c *config) {
+		c.maxRetries = n
+		c.backoffFn = backoff
+	}
 }
 
 // WithMaxBytes 设置批字节上限与条目字节量函数（Flush 触发条件之三，

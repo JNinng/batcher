@@ -29,15 +29,18 @@ type CreatedEvent struct {
 }
 
 // BatchFlushedEvent 是批完成事件。WaitSeconds 为组批耗时（首条 Item
-// 入批 → Flush 触发），DurationSeconds 为批次函数执行耗时，两者正交。
-// Size 为原始条数（重复 Item 照常占槽）；UniqueSize 为去重后条数，
-// NewKeyed 下 Size - UniqueSize 即批内重复消除量，普通 New 下两者
-// 相等，折叠失败（keyFn panic）时为 0。
+// 入批 → Flush 触发），DurationSeconds 为批次函数执行耗时（WithRetry
+// 下含重试与退避的持槽全过程），两者正交。Size 为原始条数（重复
+// Item 照常占槽）；UniqueSize 为去重后条数，NewKeyed 下 Size -
+// UniqueSize 即批内重复消除量，普通 New 下两者相等，折叠失败（keyFn
+// panic）时为 0。Retries 为该批在首次执行后的重试次数（WithRetry
+// 配置；0 即无重试），重试会拉高 wait_seconds 的端到端口径。
 type BatchFlushedEvent struct {
 	Size            int
 	UniqueSize      int
 	WaitSeconds     float64
 	DurationSeconds float64
+	Retries         int
 	Err             error
 }
 

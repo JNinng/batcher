@@ -16,6 +16,7 @@ type metrics struct {
 	durationSeconds observ.Histogram // 每批一次：批次函数执行耗时
 	queueDepth      observ.Gauge     // 已准入未交付的提交数，含停泊在握手的发送方（批边界刷新；并发交付下采样可能瞬时乱序，批边界自校正）
 	overloadedTotal observ.Counter   // 被 WithMaxPending 卸载拒绝的提交数
+	batchRetries    observ.Counter   // WithRetry 触发的重试执行次数（不含首次执行）
 }
 
 // 指标 bucket 口径：耗时覆盖亚毫秒到秒级，批大小覆盖 2 的幂。
@@ -33,5 +34,6 @@ func newMetrics(m observ.Meter) *metrics {
 		durationSeconds: m.NewHistogram("batcher_batch_duration_seconds", "批次函数执行耗时", durationBuckets),
 		queueDepth:      m.NewGauge("batcher_queue_depth", "已准入未交付的提交数（含停泊在握手的发送方，批边界刷新）"),
 		overloadedTotal: m.NewCounter("batcher_overloaded_total", "被 WithMaxPending 卸载拒绝的提交数"),
+		batchRetries:    m.NewCounter("batcher_batch_retries_total", "WithRetry 触发的重试执行次数（不含首次执行）"),
 	}
 }
