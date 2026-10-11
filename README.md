@@ -9,6 +9,7 @@
 - **同步 `Do`，按位置对位**：`Do(ctx, req)` 阻塞直到自己那份结果返回；批次函数返回与入参等长、同序的结果切片，长度不符视为整批失败。
 - **先到先触发**：批大小上限、批字节上限或时间间隔（自组批起算）先到先触发 Flush；仅有数据才触发，批次函数永远不会收到空切片。
 - **可配置下游并发**：默认串行单在途（下游并发 1，行为可预测）；`WithMaxConcurrency(n)` 放宽至同一时刻至多 n 个批次在途，组批与执行重叠——慢批次不再令后续批次空等，缓解队头阻塞。计数单位是批次而非条目。
+- **分片 Batcher**（[sharded 子包](sharded)）：`sharded.New(route, n, factory)` 把并发请求按路由函数分发给 n 个独立组批、独立执行的分片（Redis cluster、分库分表），工厂以 shard 下标按分片选连接；内置工厂与 `NewKeyed` / `NewKeyedMap` 组合（前提「同 key ⇒ 同分片」），`Close` 级联关闭全部分片。
 - **有界队列 + 负载卸载**：`WithMaxPending(n)` 限制已准入未交付的提交数（含停泊在握手上的发送方），达上限新 `Do` 立即返回 `ErrOverloaded`，避免 goroutine 无界堆积。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝。
 - **批内 key 去重**：`NewKeyed` 把同 key 的并发请求折叠为一次执行——批次函数收到去重切片（首次出现序），同 key 的 Waiter 共享结果；maxSize 仍按原始条数计数，事件双口径 `Size` / `UniqueSize`。
 - **逐条结果 / 错误**：`Result[Res]{Value, Err}` 让位置对位 API 逐条表达业务失败，结果切片仍等长；`NewKeyedMap` 是 keyed-map 变体，批次函数返回 `map[K]Res`，缺 key 转单条 `ErrMissingResult`、非整批失败。
@@ -50,7 +51,7 @@ func main() {
 	}
 
 	b := batcher.New(queryUsers,
-		batcher.WithMaxSize(10),                // 攒够 10 条立即 Flush
+		batcher.WithMaxSize(10),                   // 攒够 10 条立即 Flush
 		batcher.WithInterval(50*time.Millisecond), // 否则自组批起 50ms 后 Flush
 	)
 	defer b.Close(context.Background())
@@ -68,6 +69,12 @@ func main() {
 
 ```bash
 go run ./examples/httpserver
+```
+
+分片下游示例见 [examples/sharded](examples/sharded)——8 个分库独立组批/执行、工厂按分片选连接、热点分库负载不均可见：
+
+```bash
+go run ./examples/sharded
 ```
 
 ## 核心语义
@@ -101,7 +108,7 @@ go run ./examples/httpserver
 
 ## 可观测性
 
-**Observer**（类型化旁路事件，回调同步执行、必须快速返回：`OnBatchFlushed` 在执行 goroutine，`OnClosed` 在全部在途批次完成后的收尾段；`WithMaxConcurrency(n>1)` 下多个执行 goroutine 可并发回调，实现必须并发安全、跨批事件顺序不保证；回调 panic 会被库 recover；回调内不得同步再入本 Batcher）：
+**Observer**（类型化旁路事件，回调同步执行、必须快速返回：`OnBatchFlushed` 在执行 goroutine，`OnClosed` 在全部在途批次完成后的收尾段；回调可能并发——`WithMaxConcurrency(n>1)` 的多个执行 goroutine，或多个 Batcher（如路由层分片）共用同一 Observer——实现必须并发安全、跨批事件顺序不保证；回调 panic 会被库 recover；回调内不得同步再入本 Batcher）：
 
 ```go
 type Observer interface {
@@ -111,7 +118,7 @@ type Observer interface {
 }
 ```
 
-**指标**（注入 `observ.Meter` 后启用，命名遵循 `_total` / `_seconds` / `_depth` 约定；Meter 实现不得 panic（库不做 recover）且必须并发安全——`WithMaxConcurrency(n>1)` 下埋点从多个执行 goroutine 并发发生）：
+**指标**（注入 `observ.Meter` 后启用，命名遵循 `_total` / `_seconds` / `_depth` 约定；Meter 实现不得 panic（库不做 recover）且必须并发安全——`WithMaxConcurrency(n>1)` 或路由层分片下埋点从多个 goroutine 并发发生）：
 
 | 指标 | 类型 | 含义 |
 | --- | --- | --- |
@@ -135,5 +142,6 @@ type Observer interface {
 - [0006 Fire-and-forget 入队：Enqueue 打开写路径](docs/adr/0006-fire-and-forget-enqueue.md)
 - [0007 按字节攒批：WithMaxBytes 三决策](docs/adr/0007-max-bytes-batching.md)
 - [0008 下游并发上限：WithMaxConcurrency 与组批/执行流水线](docs/adr/0008-max-concurrency.md)
+- [0009 分片 Batcher：独立包 sharded，工厂按分片构造](docs/adr/0009-sharded-batcher.md)
 
-`New` 不做批内去重；`NewKeyed` 提供批内 key 去重，「key 相同 ⇒ 语义等价」由 key 函数声明（ADR 0004）；`NewKeyedMap` 在其上提供 map 回查与逐条缺失表示（ADR 0005）；`Enqueue`/`EnqueueFunc` 提供 fire-and-forget 入队（ADR 0006）；`WithMaxConcurrency` 放宽下游并发上限并流水线化组批与执行（ADR 0008）。
+`New` 不做批内去重；`NewKeyed` 提供批内 key 去重，「key 相同 ⇒ 语义等价」由 key 函数声明（ADR 0004）；`NewKeyedMap` 在其上提供 map 回查与逐条缺失表示（ADR 0005）；`Enqueue`/`EnqueueFunc` 提供 fire-and-forget 入队（ADR 0006）；`WithMaxConcurrency` 放宽下游并发上限并流水线化组批与执行（ADR 0008）；路由层在独立子包 [sharded](sharded)——`sharded.New` 把请求分发给 n 个独立分片 Batcher（ADR 0009）。

@@ -50,3 +50,11 @@ _Avoid_: per-item error、partial error
 **Enqueue**:
 fire-and-forget 提交路径：不等待结果，ctx 只治理本次提交（准入与入队握手）；Item 与 Do 来源一视同仁地组批执行，结果无人读取（`EnqueueFunc` 可在交付点旁路回调）。
 _Avoid_: submit、post、async do、send
+
+**Shard**:
+路由层 `sharded` 中独立组批、独立执行的分片 Batcher：按 Route 分发请求，各片独立计准入与并发上限、各发 Observer 事件；`Sharded.Close` 级联关闭全部分片。路由层与组批层分属不同包——组批层构造器返回同一个 `*Batcher`，路由层返回包装类型 `*Sharded`。
+_Avoid_: partition、bucket、worker
+
+**Route**:
+路由函数：对每条请求直接产出分片下标 `[0, n)` 的函数，须对同一请求稳定；不做 hashFn → K comparable 中间形态，二次哈希留给 route 内做。与 key 函数组合时须满足「同 key ⇒ 同分片」，否则批内去重跨片失效，属用户责任。
+_Avoid_: hash、shardFn

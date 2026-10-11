@@ -5,8 +5,9 @@ import "time"
 // Observer 是 batcher 的类型化旁路观测接口（默认 Noop）。
 // 回调同步执行、必须快速返回（微秒级）：OnCreated 在构造方 goroutine，
 // OnBatchFlushed 在执行 goroutine（持槽期间），OnClosed 在 dispatcher
-// 收尾段（全部在途批次完成后）；配置 WithMaxConcurrency(n>1) 时多个
-// 执行 goroutine 可并发回调 OnBatchFlushed——Observer 实现必须并发
+// 收尾段（全部在途批次完成后）；回调可能并发——WithMaxConcurrency(n>1)
+// 的多个执行 goroutine，或多个 Batcher（如路由层分片）共用同一
+// Observer 时可并发回调 OnBatchFlushed——Observer 实现必须并发
 // 安全，跨批事件顺序不保证；
 // 回调 panic 会被库 recover，观测不得改变业务执行语义；
 // 回调内不得同步再入本 Batcher——再入提交需等槽位，而槽位正被本
