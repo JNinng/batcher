@@ -7,7 +7,7 @@
 ## 特性
 
 - **同步 `Do`，按位置对位**：`Do(ctx, req)` 阻塞直到自己那份结果返回；批次函数返回与入参等长、同序的结果切片，长度不符视为整批失败。
-- **先到先触发**：批大小上限或时间间隔（自组批起算）先到先触发 Flush；仅有数据才触发，批次函数永远不会收到空切片。
+- **先到先触发**：批大小上限、批字节上限或时间间隔（自组批起算）先到先触发 Flush；仅有数据才触发，批次函数永远不会收到空切片。
 - **串行单在途**：同一时刻至多一个 In-flight Batch，下游并发恒为 1，行为可预测。
 - **有界队列 + 负载卸载**：`WithMaxPending(n)` 限制已准入未交付的提交数（含停泊在握手上的发送方），达上限新 `Do` 立即返回 `ErrOverloaded`，避免 goroutine 无界堆积。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝。
 - **批内 key 去重**：`NewKeyed` 把同 key 的并发请求折叠为一次执行——批次函数收到去重切片（首次出现序），同 key 的 Waiter 共享结果；maxSize 仍按原始条数计数，事件双口径 `Size` / `UniqueSize`。
@@ -74,7 +74,7 @@ go run ./examples/httpserver
 
 | 语义 | 行为 |
 | --- | --- |
-| Flush 触发 | 批大小上限或时间间隔先到先触发；时间间隔自组批起点（第一条 Item 进入空批）起算，是尽力而为的软上限。空批不计时、不唤醒。 |
+| Flush 触发 | 批大小上限、批字节上限或时间间隔先到先触发；时间间隔自组批起点（第一条 Item 进入空批）起算，是尽力而为的软上限。空批不计时、不唤醒。字节按原始条目累计，单条即超限自成批大小 1 的孤批——不拆分、不丢弃。 |
 | 下游并发 | 恒为 1：批次函数执行期间新 Item 只排队，不产生并发批量调用。 |
 | 负载卸载 | 配置 `WithMaxPending(n)` 后，已准入未交付的提交数达 n 即拒绝：新 `Do` 立即返回 `ErrOverloaded`，不入队。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝（其他提交的拒绝尚未回滚、计数瞬时虚高），被拒调用方可退避重试。Formation 与在途中的 Item 同样占用额度：批次大小恒不超过 n，n < MaxSize 时批大小触发不可达。未配置即无界。 |
 | 批内去重 | `NewKeyed(key, fn)` 在交付边界折叠同 key Item：批次函数收到去重切片（首次出现序，重复 key 只首达 Req 送达下游），`len(res) == len(unique)`，同 key 的 Waiter 共享同一条执行、各自取得一份结果。「key 相同 ⇒ 语义等价」由 key 函数的提供方声明。maxSize 按原始条数计数，重复照常占槽触发 Flush；跨批去重不做，执行期到达的重复 key 落入下一批重查；key 函数 panic 降级为批级错误、库继续可用。 |
@@ -91,11 +91,12 @@ go run ./examples/httpserver
 | `WithMaxSize(n)` | **必填**，批大小上限，必须 > 0。 |
 | `WithInterval(d)` | **必填**，组批时间间隔，必须 > 0。 |
 | `WithMaxPending(n)` | 已准入未交付提交数上限（负载卸载），达上限立即返回 `ErrOverloaded`；已准入提交数恒不超过 n，并发竞争下仅可能被假阳性提前拒绝；n < MaxSize 时批大小触发不可达。0 等价未设置（无界）。 |
+| `WithMaxBytes(n, size)` | 批字节上限（Flush 触发条件之三，与条数/时间并列先到先触发），`size func(Req) int` 由你声明条目字节量；按原始条目累计（keyed 批的重复照常计费），单条超限自成孤批。n 必须 > 0，size 的 Req 须与 Batcher 一致，失配构造期 panic；size panic 或返回负数 → 该批整体失败（不调批次函数）。 |
 | `WithObserver(o)` | 注入 `Observer` 旁路观测，默认 `NoopObserver`。 |
 | `WithMeter(m)` | 注入 `observ.Meter` 指标，默认 Noop。 |
 | `WithLogger(l)` | 注入 `observ.Logger` 日志，未注入时构造期快照默认 Logger。 |
 
-`fn` 或 key 函数为 nil、必填选项缺失或非正、`MaxPending` 为负属程序员工错，构造期 panic（`New` / `NewKeyed` / `NewKeyedMap`）。
+`fn` 或 key 函数为 nil、必填选项缺失或非正、`MaxPending` 为负、`MaxBytes` 为负或其 size 函数缺失/与 Req 失配属程序员工错，构造期 panic（`New` / `NewKeyed` / `NewKeyedMap`）。
 
 ## 可观测性
 
@@ -131,5 +132,6 @@ type Observer interface {
 - [0004 批内 key 去重：独立构造器 NewKeyed，折叠在交付边界](docs/adr/0004-keyed-in-batch-dedup.md)
 - [0005 逐条结果表示：Result 与 keyed-map 变体](docs/adr/0005-per-item-result.md)
 - [0006 Fire-and-forget 入队：Enqueue 打开写路径](docs/adr/0006-fire-and-forget-enqueue.md)
+- [0007 按字节攒批：WithMaxBytes 三决策](docs/adr/0007-max-bytes-batching.md)
 
 `New` 不做批内去重；`NewKeyed` 提供批内 key 去重，「key 相同 ⇒ 语义等价」由 key 函数声明（ADR 0004）；`NewKeyedMap` 在其上提供 map 回查与逐条缺失表示（ADR 0005）；`Enqueue`/`EnqueueFunc` 提供 fire-and-forget 入队（ADR 0006）。

@@ -3,8 +3,9 @@
 //
 // 语义摘要（依据 docs/adr/）：
 //   - Do 同步阻塞直到自己那份结果返回；
-//   - Flush 触发条件为批大小上限或时间间隔（自组批起算），先到先触发，
-//     且仅有数据才实际触发——批次函数永远不会收到空切片；
+//   - Flush 触发条件为批大小上限、批字节上限（WithMaxBytes）或时间
+//     间隔（自组批起算），先到先触发，且仅有数据才实际触发——批次
+//     函数永远不会收到空切片；
 //   - 同一时刻至多一个 In-flight Batch，下游并发恒为 1；
 //   - 准入可有界（WithMaxPending）：已准入未交付的提交数达上限即负载
 //     卸载，新 Do 立即返回 ErrOverloaded，避免 goroutine 无界堆积；
@@ -74,6 +75,8 @@ type Batcher[Req, Res any] struct {
 	interval   time.Duration
 	maxPending int                // 已准入未交付提交数上限；0 即无界
 	fold       foldFunc[Req, Res] // 批内 key 折叠，NewKeyed 注入；New 为 nil
+	maxBytes   int                // 批字节上限；0 即无字节上限
+	sizeFn     func(Req) int      // 条目字节量函数，maxBytes > 0 时必设
 
 	inbox    chan *item[Req, Res] // 无缓冲：执行期间新 Item 停靠在此；停泊发送方已过准入，计入 admitted
 	closing  chan struct{}        // Close 已开始，新 Do 立即 ErrClosed
@@ -98,7 +101,8 @@ type Batcher[Req, Res any] struct {
 }
 
 // New 构造 Batcher 并启动 dispatcher。fn 为 nil、MaxSize/Interval
-// 缺失或非正、MaxPending 为负属程序员工错，构造期 panic。
+// 缺失或非正、MaxPending 为负、MaxBytes 为负或其 size 函数缺失/类型
+// 与 Req 失配属程序员工错，构造期 panic。
 func New[Req, Res any](fn BatchFunc[Req, Res], opts ...Option) *Batcher[Req, Res] {
 	return newBatcher(fn, nil, opts...)
 }
@@ -137,6 +141,23 @@ func newBatcher[Req, Res any](fn BatchFunc[Req, Res], fold foldFunc[Req, Res], o
 	if cfg.maxPending < 0 {
 		panic("batcher: WithMaxPending must not be negative")
 	}
+	if cfg.maxBytes < 0 {
+		panic("batcher: WithMaxBytes must not be negative")
+	}
+	if cfg.maxBytes > 0 && cfg.sizeFn == nil {
+		panic("batcher: WithMaxBytes size function must not be nil")
+	}
+	var sizeFn func(Req) int
+	if cfg.sizeFn != nil {
+		if cfg.maxBytes <= 0 {
+			panic("batcher: WithMaxBytes must be > 0")
+		}
+		sf, ok := cfg.sizeFn.(func(Req) int) // Option 无类型参数，失配在此显式拒绝
+		if !ok {
+			panic("batcher: WithMaxBytes size function does not match Batcher's Req type")
+		}
+		sizeFn = sf
+	}
 	if cfg.observer == nil {
 		cfg.observer = NoopObserver
 	}
@@ -154,6 +175,8 @@ func newBatcher[Req, Res any](fn BatchFunc[Req, Res], fold foldFunc[Req, Res], o
 		interval:   cfg.interval,
 		maxPending: cfg.maxPending,
 		fold:       fold,
+		maxBytes:   cfg.maxBytes,
+		sizeFn:     sizeFn,
 		inbox:      make(chan *item[Req, Res]),
 		closing:    make(chan struct{}),
 		shutdown:   make(chan struct{}),
@@ -353,30 +376,44 @@ func (b *Batcher[Req, Res]) run() {
 		case <-b.shutdown:
 			batch := b.drain(nil)
 			if len(batch) > 0 {
-				b.execute(batch, time.Now())
+				b.execute(batch, time.Now(), nil)
 			}
 			return
 		}
 		formationStart := time.Now()
-		batch := b.collect(first)
+		batch, ferr := b.collect(first)
 		if b.stopped() {
 			batch = b.drain(batch)
 			if len(batch) > 0 {
-				b.execute(batch, formationStart)
+				b.execute(batch, formationStart, ferr)
 			}
 			return
 		}
-		b.execute(batch, formationStart)
+		b.execute(batch, formationStart, ferr)
 	}
 }
 
-// collect 自首条 Item 起组批：size 达上限或 interval 到期先到先止；
-// shutdown 亦立即止，交由调用方 drain。首条即满批（maxSize==1）时
-// 无需计时器。
-func (b *Batcher[Req, Res]) collect(first *item[Req, Res]) []*item[Req, Res] {
+// collect 自首条 Item 起组批：条数达上限、字节达上限或 interval 到期
+// 先到先止；shutdown 亦立即止，交由调用方 drain。首条即满批或即超限
+// 时无需计时器。字节按原始条目累计（折叠发生在交付边界，重复 Item
+// 照常占槽计费）；sizeFn panic 或负数返回时整批预置失败、不调批次
+// 函数（组批运行于 dispatcher goroutine，无人 recover 会打穿
+// dispatcher、进程崩溃）。drain 路径不计字节——关闭 flush 无条件。
+func (b *Batcher[Req, Res]) collect(first *item[Req, Res]) ([]*item[Req, Res], error) {
 	batch := []*item[Req, Res]{first}
 	if len(batch) >= b.maxSize {
-		return batch
+		return batch, nil
+	}
+	bytes := 0
+	if b.maxBytes > 0 {
+		n, err := b.sizeOf(first.req)
+		if err != nil {
+			return batch, err
+		}
+		bytes = n
+		if bytes >= b.maxBytes {
+			return batch, nil
+		}
 	}
 	timer := time.NewTimer(b.interval)
 	defer timer.Stop()
@@ -384,13 +421,35 @@ func (b *Batcher[Req, Res]) collect(first *item[Req, Res]) []*item[Req, Res] {
 		select {
 		case it := <-b.inbox:
 			batch = append(batch, it)
+			if b.maxBytes > 0 {
+				n, err := b.sizeOf(it.req)
+				if err != nil {
+					return batch, err
+				}
+				bytes += n
+				if bytes >= b.maxBytes {
+					return batch, nil
+				}
+			}
 		case <-timer.C:
-			return batch
+			return batch, nil
 		case <-b.shutdown:
-			return batch
+			return batch, nil
 		}
 	}
-	return batch
+	return batch, nil
+}
+
+// sizeOf 评估条目字节量，仅配置 WithMaxBytes 时被调用（未配置零开销）。
+// panic 降级为批级错误（与 key 函数同款约束）；返回负数同样批级失败——
+// 负计费会让字节触发静默失效。
+func (b *Batcher[Req, Res]) sizeOf(req Req) (bytes int, err error) {
+	defer recoverAsBatchError("size function", &err)
+	n := b.sizeFn(req)
+	if n < 0 {
+		return 0, fmt.Errorf("batcher: size function returned negative value %d", n)
+	}
+	return n, nil
 }
 
 // drain 非阻塞清空 inbox 中已停靠的 Item（含停泊中的发送方握手）。
@@ -406,8 +465,10 @@ func (b *Batcher[Req, Res]) drain(batch []*item[Req, Res]) []*item[Req, Res] {
 }
 
 // execute 调用批次函数并按位置交付结果，随后记录观测。
-// formationStart 用于 WaitSeconds（组批耗时）口径。
-func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time.Time) {
+// formationStart 用于 WaitSeconds（组批耗时）口径；presetErr 非 nil
+// 表示组批阶段已失败（sizeFn panic 或负数返回），整批直接以此错误
+// 交付、不调批次函数（UniqueSize 为 0，与折叠前失败口径一致）。
+func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time.Time, presetErr error) {
 	reqs := make([]Req, len(batch))
 	for i, it := range batch {
 		reqs[i] = it.req
@@ -415,7 +476,14 @@ func (b *Batcher[Req, Res]) execute(batch []*item[Req, Res], formationStart time
 
 	waitSeconds := time.Since(formationStart).Seconds() // 组批耗时：入批 → Flush 触发
 	started := time.Now()
-	res, uniqueSize, err := b.callBatch(reqs)
+	var res []Res
+	var uniqueSize int
+	var err error
+	if presetErr != nil {
+		err = presetErr // 组批阶段已失败：不调批次函数
+	} else {
+		res, uniqueSize, err = b.callBatch(reqs)
+	}
 	durationSeconds := time.Since(started).Seconds()
 
 	for i, it := range batch {
