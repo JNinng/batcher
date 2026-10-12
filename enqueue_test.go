@@ -75,11 +75,15 @@ type observerFunc struct {
 
 func (f observerFunc) OnCreated(batcher.CreatedEvent) {}
 
+func (f observerFunc) OnFlushStart(batcher.FlushStartEvent) {}
+
 func (f observerFunc) OnBatchFlushed(e batcher.BatchFlushedEvent) {
 	if f.onFlushed != nil {
 		f.onFlushed(e)
 	}
 }
+
+func (f observerFunc) OnItemDiscarded(batcher.ItemDiscardedEvent) {}
 
 func (f observerFunc) OnClosed(batcher.ClosedEvent) {}
 

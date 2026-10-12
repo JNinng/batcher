@@ -1,10 +1,12 @@
 package batcher_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,10 +18,12 @@ import (
 
 // recordingObserver 记录全部事件（回调必须并发安全）。
 type recordingObserver struct {
-	mu      sync.Mutex
-	created []batcher.CreatedEvent
-	flushed []batcher.BatchFlushedEvent
-	closed  int
+	mu         sync.Mutex
+	created    []batcher.CreatedEvent
+	flushStart []batcher.FlushStartEvent
+	flushed    []batcher.BatchFlushedEvent
+	discarded  []batcher.ItemDiscardedEvent
+	closed     int
 }
 
 func (o *recordingObserver) OnCreated(e batcher.CreatedEvent) {
@@ -28,10 +32,22 @@ func (o *recordingObserver) OnCreated(e batcher.CreatedEvent) {
 	o.created = append(o.created, e)
 }
 
+func (o *recordingObserver) OnFlushStart(e batcher.FlushStartEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.flushStart = append(o.flushStart, e)
+}
+
 func (o *recordingObserver) OnBatchFlushed(e batcher.BatchFlushedEvent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.flushed = append(o.flushed, e)
+}
+
+func (o *recordingObserver) OnItemDiscarded(e batcher.ItemDiscardedEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.discarded = append(o.discarded, e)
 }
 
 func (o *recordingObserver) OnClosed(e batcher.ClosedEvent) {
@@ -169,8 +185,11 @@ func TestObserverReceivesLifecycleAndFlushEvents(t *testing.T) {
 	if len(obs.created) != 1 || obs.created[0].MaxSize != 2 || obs.created[0].Interval != interval {
 		t.Fatalf("created events = %+v, want one {MaxSize:2 Interval:%v}", obs.created, interval)
 	}
-	if len(obs.flushed) != 1 {
-		t.Fatalf("flushed events = %d, want 1", len(obs.flushed))
+	if len(obs.flushStart) != 1 || len(obs.flushed) != 1 {
+		t.Fatalf("flushStart = %d, flushed = %d, want 各 1（以 Seq 恒成对）", len(obs.flushStart), len(obs.flushed))
+	}
+	if f := obs.flushed[0]; f.Seq != obs.flushStart[0].Seq {
+		t.Fatalf("Seq 配对失败：flushStart.Seq = %d, flushed.Seq = %d", obs.flushStart[0].Seq, f.Seq)
 	}
 	f := obs.flushed[0]
 	if f.Size != 2 || f.Err != nil || f.WaitSeconds < 0 || f.DurationSeconds < 0 {
@@ -178,6 +197,12 @@ func TestObserverReceivesLifecycleAndFlushEvents(t *testing.T) {
 	}
 	if f.UniqueSize != f.Size {
 		t.Fatalf("UniqueSize = %d, want == Size %d（普通 New 不去重）", f.UniqueSize, f.Size)
+	}
+	if f.Trigger != batcher.TriggerSize {
+		t.Fatalf("Trigger = %q, want %q（两条即满批）", f.Trigger, batcher.TriggerSize)
+	}
+	if f.Panic != nil || f.Stack != nil {
+		t.Fatalf("Panic = %v, Stack 非空——正常批不得携带 panic 现场", f.Panic)
 	}
 	if obs.closed != 1 {
 		t.Fatalf("closed events = %d, want 1", obs.closed)
@@ -228,9 +253,11 @@ func TestObserverPanicIsRecovered(t *testing.T) {
 
 type panicOnFlushObserver struct{}
 
-func (panicOnFlushObserver) OnCreated(batcher.CreatedEvent)           {}
-func (panicOnFlushObserver) OnBatchFlushed(batcher.BatchFlushedEvent) { panic("observer explodes") }
-func (panicOnFlushObserver) OnClosed(batcher.ClosedEvent)             {}
+func (panicOnFlushObserver) OnCreated(batcher.CreatedEvent)             {}
+func (panicOnFlushObserver) OnFlushStart(batcher.FlushStartEvent)       {}
+func (panicOnFlushObserver) OnBatchFlushed(batcher.BatchFlushedEvent)   { panic("observer explodes") }
+func (panicOnFlushObserver) OnItemDiscarded(batcher.ItemDiscardedEvent) {}
+func (panicOnFlushObserver) OnClosed(batcher.ClosedEvent)               {}
 
 func TestMetricsRecordedOnFlush(t *testing.T) {
 	m := newFakeMeter()
@@ -345,8 +372,14 @@ func TestLoggerDefaultsToObservDefaultSnapshot(t *testing.T) {
 type panicOnEverythingObserver struct{}
 
 func (panicOnEverythingObserver) OnCreated(batcher.CreatedEvent) { panic("created explodes") }
+func (panicOnEverythingObserver) OnFlushStart(batcher.FlushStartEvent) {
+	panic("flush-start explodes")
+}
 func (panicOnEverythingObserver) OnBatchFlushed(batcher.BatchFlushedEvent) {
 	panic("flushed explodes")
+}
+func (panicOnEverythingObserver) OnItemDiscarded(batcher.ItemDiscardedEvent) {
+	panic("discarded explodes")
 }
 func (panicOnEverythingObserver) OnClosed(batcher.ClosedEvent) { panic("closed explodes") }
 
@@ -492,10 +525,22 @@ func (o *seqObserver) OnCreated(batcher.CreatedEvent) {
 	o.seq = append(o.seq, "created")
 }
 
+func (o *seqObserver) OnFlushStart(batcher.FlushStartEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.seq = append(o.seq, "flush-start")
+}
+
 func (o *seqObserver) OnBatchFlushed(batcher.BatchFlushedEvent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.seq = append(o.seq, "flushed")
+}
+
+func (o *seqObserver) OnItemDiscarded(batcher.ItemDiscardedEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.seq = append(o.seq, "discarded")
 }
 
 func (o *seqObserver) OnClosed(batcher.ClosedEvent) {
@@ -504,7 +549,7 @@ func (o *seqObserver) OnClosed(batcher.ClosedEvent) {
 	o.seq = append(o.seq, "closed")
 }
 
-// 约束：事件全序为 Created → Flushed* → Closed，
+// 约束：事件全序为 Created → (FlushStart → Flushed)* → Closed，
 // 且并发 Close 下 OnClosed 恰好一次。
 func TestEventOrderingAndOnClosedExactlyOnce(t *testing.T) {
 	obs := &seqObserver{}
@@ -539,8 +584,308 @@ func TestEventOrderingAndOnClosedExactlyOnce(t *testing.T) {
 
 	obs.mu.Lock()
 	defer obs.mu.Unlock()
-	want := "[created flushed flushed closed]"
+	want := "[created flush-start flushed flush-start flushed closed]"
 	if got := fmt.Sprint(obs.seq); got != want {
 		t.Fatalf("event sequence = %s, want %s", got, want)
 	}
+}
+
+// startFlagObserver 在 OnFlushStart 置位，供批次函数侧断言先后。
+type startFlagObserver struct {
+	started atomic.Bool
+}
+
+func (o *startFlagObserver) OnCreated(batcher.CreatedEvent)             {}
+func (o *startFlagObserver) OnFlushStart(batcher.FlushStartEvent)       { o.started.Store(true) }
+func (o *startFlagObserver) OnBatchFlushed(batcher.BatchFlushedEvent)   {}
+func (o *startFlagObserver) OnItemDiscarded(batcher.ItemDiscardedEvent) {}
+func (o *startFlagObserver) OnClosed(batcher.ClosedEvent)               {}
+
+// 约束：OnFlushStart 在批次函数调用前触发——执行 goroutine 拿到
+// 在途槽位、进入 execute 即发事件，fn 执行时必然已观察到置位。
+func TestFlushStartFiresBeforeBatchFunction(t *testing.T) {
+	obs := &startFlagObserver{}
+	b := batcher.New[int, int](func(ctx context.Context, reqs []int) ([]int, error) {
+		if !obs.started.Load() {
+			t.Error("batch function ran before OnFlushStart")
+		}
+		return append([]int(nil), reqs...), nil
+	},
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+		batcher.WithObserver(obs),
+	)
+	if _, err := b.Do(context.Background(), 1); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// 约束：Seq 以成批序在 Batcher 内自 1 单调递增，OnFlushStart 与
+// OnBatchFlushed 逐批配对（含关闭 drain 批）。
+func TestFlushEventSeqMonotonicAndPaired(t *testing.T) {
+	obs := &recordingObserver{}
+	b := batcher.New[int, int](identityFn,
+		batcher.WithMaxSize(1),
+		batcher.WithInterval(10*time.Millisecond),
+		batcher.WithObserver(obs),
+	)
+	for i := 1; i <= 3; i++ {
+		if _, err := b.Do(context.Background(), i); err != nil {
+			t.Fatalf("Do(%d): %v", i, err)
+		}
+	}
+	if err := b.Enqueue(context.Background(), 4); err != nil { // 收尾 drain 批同样领号
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.flushStart) != 4 || len(obs.flushed) != 4 {
+		t.Fatalf("flushStart = %d, flushed = %d, want 各 4", len(obs.flushStart), len(obs.flushed))
+	}
+	for i := 0; i < 4; i++ {
+		if obs.flushStart[i].Seq != int64(i+1) || obs.flushed[i].Seq != int64(i+1) {
+			t.Fatalf("batch %d Seq = (start %d, flushed %d), want 两侧均为 %d",
+				i+1, obs.flushStart[i].Seq, obs.flushed[i].Seq, i+1)
+		}
+	}
+}
+
+// 约束：Trigger 报告组批的实际结束条件——interval 到期、字节达限、
+// Close 截断（正常路径成批）与 Close 收尾 drain 各就各位。
+func TestFlushEventTriggerReportsFormationEnd(t *testing.T) {
+	t.Run("interval", func(t *testing.T) {
+		obs := &recordingObserver{}
+		b := batcher.New[int, int](identityFn,
+			batcher.WithMaxSize(100), // interval 独占触发
+			batcher.WithInterval(60*time.Millisecond),
+			batcher.WithObserver(obs),
+		)
+		if _, err := b.Do(context.Background(), 1); err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		if len(obs.flushed) != 1 || obs.flushed[0].Trigger != batcher.TriggerInterval {
+			t.Fatalf("flushed = %+v, want Trigger=%q", obs.flushed, batcher.TriggerInterval)
+		}
+	})
+
+	t.Run("bytes", func(t *testing.T) {
+		obs := &recordingObserver{}
+		b := batcher.New[int, int](identityFn,
+			batcher.WithMaxSize(100),
+			batcher.WithInterval(10*time.Second), // 字节先到：8B 达限，interval 永不触发
+			batcher.WithMaxBytes(8, func(int) int { return 4 }),
+			batcher.WithObserver(obs),
+		)
+		done := make(chan struct{}, 2)
+		release := launchTogether(2, func(i int) {
+			defer func() { done <- struct{}{} }()
+			if _, err := b.Do(context.Background(), i+1); err != nil {
+				t.Errorf("Do(%d): %v", i+1, err)
+			}
+		})
+		release()
+		<-done
+		<-done
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		if len(obs.flushed) != 1 || obs.flushed[0].Trigger != batcher.TriggerBytes {
+			t.Fatalf("flushed = %+v, want Trigger=%q（4B+4B 达限）", obs.flushed, batcher.TriggerBytes)
+		}
+	})
+
+	t.Run("close-cut", func(t *testing.T) {
+		obs := &recordingObserver{}
+		b := batcher.New[int, int](identityFn,
+			batcher.WithMaxSize(3), // 两条不满，组批停在 interval/shutdown 二选一
+			batcher.WithInterval(10*time.Second),
+			batcher.WithObserver(obs),
+		)
+		done := make(chan struct{}, 2)
+		release := launchTogether(2, func(i int) {
+			defer func() { done <- struct{}{} }()
+			_, _ = b.Do(context.Background(), i+1) // Close 截断后照常交付
+		})
+		release()
+		time.Sleep(50 * time.Millisecond) // 等两条全部被接收、批成型
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		<-done
+		<-done
+
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		if len(obs.flushed) != 1 || obs.flushed[0].Trigger != batcher.TriggerClose {
+			t.Fatalf("flushed = %+v, want Trigger=%q（组批被 Close 截断）", obs.flushed, batcher.TriggerClose)
+		}
+		if obs.flushed[0].Seq != 1 {
+			t.Fatalf("Seq = %d, want 1（正常路径成批领号，收尾不重复领取）", obs.flushed[0].Seq)
+		}
+	})
+
+	t.Run("close-drain", func(t *testing.T) {
+		obs := &recordingObserver{}
+		b := batcher.New[int, int](identityFn,
+			batcher.WithMaxSize(100),
+			batcher.WithInterval(10*time.Second), // 仅 Close 能触发 flush
+			batcher.WithObserver(obs),
+		)
+		if err := b.Enqueue(context.Background(), 1); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		if len(obs.flushed) != 1 || obs.flushed[0].Trigger != batcher.TriggerClose {
+			t.Fatalf("flushed = %+v, want Trigger=%q（关闭 flush 无条件）", obs.flushed, batcher.TriggerClose)
+		}
+	})
+}
+
+// 约束：Panic / Stack 仅当终态错误由批次函数 panic 降级而来时非 nil，
+// 携带 recover 值与调用栈；key / size 函数的 panic 不捕获（Err 信息可辨）。
+func TestFlushEventCapturesBatchFunctionPanic(t *testing.T) {
+	t.Run("batch-function-panic-captured", func(t *testing.T) {
+		obs := &recordingObserver{}
+		b := batcher.New[int, int](func(ctx context.Context, reqs []int) ([]int, error) {
+			panic("kaboom-payload")
+		},
+			batcher.WithMaxSize(1),
+			batcher.WithInterval(10*time.Millisecond),
+			batcher.WithObserver(obs),
+		)
+		if _, err := b.Do(context.Background(), 1); err == nil || !strings.Contains(err.Error(), "panicked") {
+			t.Fatalf("Do err = %v, want 含 panicked 的 Batch Error", err)
+		}
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		f := obs.flushed[0]
+		if f.Panic != "kaboom-payload" {
+			t.Fatalf("Panic = %v, want kaboom-payload（recover 原值）", f.Panic)
+		}
+		if len(f.Stack) == 0 || !bytes.Contains(f.Stack, []byte("goroutine")) {
+			t.Fatalf("Stack = %q, want 非空的 recover 点调用栈", f.Stack)
+		}
+	})
+
+	t.Run("size-function-panic-not-captured", func(t *testing.T) {
+		obs := &recordingObserver{}
+		b := batcher.New[int, int](identityFn,
+			batcher.WithMaxSize(2), // 首条不满批：collect 走到字节评估，sizeFn panic 预置失败
+			batcher.WithInterval(10*time.Millisecond),
+			batcher.WithMaxBytes(8, func(int) int { panic("size explodes") }),
+			batcher.WithObserver(obs),
+		)
+		if _, err := b.Do(context.Background(), 1); err == nil || !strings.Contains(err.Error(), "size function panicked") {
+			t.Fatalf("Do err = %v, want size 函数 panic 的批级错误", err)
+		}
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		f := obs.flushed[0]
+		if f.Panic != nil || f.Stack != nil {
+			t.Fatalf("Panic = %v, Stack 非空——size 函数 panic 不捕获现场", f.Panic)
+		}
+		if !strings.Contains(f.Err.Error(), "size function panicked") {
+			t.Fatalf("Err = %v, want 保留 size panic 信息", f.Err)
+		}
+	})
+}
+
+// 约束（近似信号口径）：仅 Do 来源、交付时 caller ctx 已取消才发
+// OnItemDiscarded 并计 discarded_items；fire-and-forget 来源结果本就
+// 旁路消费，不触发。
+func TestItemDiscardedOnCallerCancelOnly(t *testing.T) {
+	t.Run("do-cancelled-at-delivery", func(t *testing.T) {
+		m := newFakeMeter()
+		obs := &recordingObserver{}
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		b := batcher.New[int, int](func(ctx context.Context, reqs []int) ([]int, error) {
+			close(entered)
+			<-release
+			return append([]int(nil), reqs...), nil
+		},
+			batcher.WithMaxSize(1),
+			batcher.WithInterval(10*time.Second),
+			batcher.WithObserver(obs),
+			batcher.WithMeter(m),
+		)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := b.Do(ctx, 1)
+			done <- err
+		}()
+		<-entered // 批次函数已执行：Item 早已入队
+		cancel()  // 调用方放弃等待；Item 保留照常执行
+		close(release)
+		// 不断言 Do 的返回：cancel 后 resCh/ctx.Done 双就绪，waiter 侧
+		// select 随机选择（契约明文的近似信号口径）；交付侧事件才是确定的。
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		if len(obs.discarded) != 1 || obs.discarded[0].BatchSize != 1 {
+			t.Fatalf("discarded = %+v, want 一条 {BatchSize:1}", obs.discarded)
+		}
+		if v := m.counters["batcher_discarded_items_total"].Value(); v != 1 {
+			t.Fatalf("batcher_discarded_items_total = %v, want 1", v)
+		}
+	})
+
+	t.Run("enqueue-never-discarded", func(t *testing.T) {
+		m := newFakeMeter()
+		obs := &recordingObserver{}
+		b := batcher.New[int, int](identityFn,
+			batcher.WithMaxSize(2), // 与 Do 来源同批交付
+			batcher.WithInterval(10*time.Second),
+			batcher.WithObserver(obs),
+			batcher.WithMeter(m),
+		)
+		ctx, cancel := context.WithCancel(context.Background())
+		if err := b.Enqueue(ctx, 1); err != nil { // 握手后 ctx 取消：结果本就无人读取
+			t.Fatalf("Enqueue: %v", err)
+		}
+		cancel()
+		if _, err := b.Do(context.Background(), 2); err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		if err := b.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		obs.mu.Lock()
+		defer obs.mu.Unlock()
+		if len(obs.discarded) != 0 {
+			t.Fatalf("discarded = %+v, want 空（fire-and-forget 不参与）", obs.discarded)
+		}
+		if v := m.counters["batcher_discarded_items_total"].Value(); v != 0 {
+			t.Fatalf("batcher_discarded_items_total = %v, want 0", v)
+		}
+	})
 }

@@ -208,9 +208,17 @@ func (printObserver) OnCreated(e batcher.CreatedEvent) {
 	fmt.Printf("[观测] created maxSize=%d interval=%v\n", e.MaxSize, e.Interval)
 }
 
+func (printObserver) OnFlushStart(e batcher.FlushStartEvent) {
+	fmt.Printf("[观测] flush-start seq=%d\n", e.Seq)
+}
+
 func (printObserver) OnBatchFlushed(e batcher.BatchFlushedEvent) {
-	fmt.Printf("[观测] flush size=%d unique=%d wait=%.1fms duration=%.1fms err=%v\n",
-		e.Size, e.UniqueSize, e.WaitSeconds*1000, e.DurationSeconds*1000, e.Err)
+	fmt.Printf("[观测] flush seq=%d trigger=%s size=%d unique=%d wait=%.1fms duration=%.1fms panic=%v err=%v\n",
+		e.Seq, e.Trigger, e.Size, e.UniqueSize, e.WaitSeconds*1000, e.DurationSeconds*1000, e.Panic, e.Err)
+}
+
+func (printObserver) OnItemDiscarded(e batcher.ItemDiscardedEvent) {
+	fmt.Printf("[观测] discarded batchSize=%d（交付时 caller ctx 已取消）\n", e.BatchSize)
 }
 
 func (printObserver) OnClosed(batcher.ClosedEvent) {

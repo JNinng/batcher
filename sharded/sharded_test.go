@@ -28,7 +28,9 @@ func (o *recordingObserver) OnCreated(batcher.CreatedEvent) {
 	o.mu.Unlock()
 }
 
-func (o *recordingObserver) OnBatchFlushed(batcher.BatchFlushedEvent) {}
+func (o *recordingObserver) OnFlushStart(batcher.FlushStartEvent)       {}
+func (o *recordingObserver) OnBatchFlushed(batcher.BatchFlushedEvent)   {}
+func (o *recordingObserver) OnItemDiscarded(batcher.ItemDiscardedEvent) {}
 
 func (o *recordingObserver) OnClosed(batcher.ClosedEvent) {
 	o.mu.Lock()

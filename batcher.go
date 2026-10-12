@@ -25,7 +25,11 @@
 //     批次重试（含退避，持槽进行）；
 //   - 调用方取消仅解除自身等待，Item 保留照常执行；
 //   - 批次函数运行于 batcher 级基础 ctx；Close 正常返回即全部已入队
-//     Waiter 已被唤醒。
+//     Waiter 已被唤醒；
+//   - 旁路观测覆盖批次生命周期：OnFlushStart 与 OnBatchFlushed 以 Seq
+//     恒成对，flushed 事件携带 Trigger（size / bytes / interval / close）
+//     与批次函数 panic 现场（Panic / Stack）；Do 来源的 Item 交付时
+//     caller ctx 已取消即触发 OnItemDiscarded（结果无人读取的近似信号）。
 package batcher
 
 import (
@@ -33,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,13 +68,25 @@ type delivery[Res any] struct {
 	err error
 }
 
+// panicCapture 承载批次函数 panic 的现场：recover 到的值与捕获于
+// recover 点的调用栈，随 BatchFlushedEvent.Panic / Stack 旁路输出。
+type panicCapture struct {
+	value any
+	stack []byte
+}
+
 // item 是一条已入队的请求及其交付通道（缓冲 1，绝不阻塞派发）。
 // cb 为 fire-and-forget 提交的 per-item 回调，Do 来源恒为 nil。
+// callerCtx / waited 供交付点旁查：仅 Do 来源（waited）在交付时检查
+// caller ctx，已取消即发 OnItemDiscarded——fire-and-forget 的结果本就
+// 旁路消费，不参与该观测。
 type item[Req, Res any] struct {
 	req       Req
 	arrivedAt time.Time
 	resCh     chan delivery[Res]
 	cb        func(res Res, err error)
+	callerCtx context.Context
+	waited    bool
 }
 
 // foldFunc 把原始批折叠为按 key 去重的切片（保持首次出现序），连同
@@ -78,13 +95,16 @@ type item[Req, Res any] struct {
 type foldFunc[Req, Res any] func(reqs []Req) (unique []Req, scatter func(res []Res) []Res, err error)
 
 // batchJob 是一次已成批待执行的结算单元：批本体、组批耗时（首条
-// Item 入批 → Flush 触发，在成批处结算，不含槽位排队时间）与组批期
-// 预置失败（sizeFn panic 或负数返回，此时不调批次函数）。
-// flushAndAwait → launch → execute 一路携带。
+// Item 入批 → Flush 触发，在成批处结算，不含槽位排队时间）、组批期
+// 预置失败（sizeFn panic 或负数返回，此时不调批次函数）、批序号
+// （Batcher 内自 1 单调递增，OnFlushStart / OnBatchFlushed 以之配对）
+// 与 Flush 触发条件。flushAndAwait → launch → execute 一路携带。
 type batchJob[Req, Res any] struct {
 	batch       []*item[Req, Res]
 	waitSeconds float64
 	presetErr   error
+	seq         int64
+	trigger     FlushTrigger
 }
 
 // Batcher 将零散 Do 扇入为批量调用。构造后即可并发使用 Do；
@@ -123,6 +143,10 @@ type Batcher[Req, Res any] struct {
 	// 才反映真实积压——接收侧口径（收到才计数）批间恒 ≤ maxSize，
 	// 原理上看不见这部分积压，故 gauge 取准入口径。
 	admitted atomic.Int64
+
+	// batchSeq 是批序号发号器：每个实际执行的批（含关闭 drain 批）在
+	// 成批时 Add(1) 领号，OnFlushStart / OnBatchFlushed 以之配对。
+	batchSeq atomic.Int64
 }
 
 // New 构造 Batcher 并启动 dispatcher。fn 为 nil、MaxSize/Interval
@@ -298,7 +322,7 @@ func callKey[K comparable, Req any](key func(Req) K, req Req) (k K, err error) {
 // 的提交数达上限时，调用立即返回 ErrOverloaded，不入队。
 func (b *Batcher[Req, Res]) Do(ctx context.Context, req Req) (Res, error) {
 	var zero Res
-	it, err := b.submit(ctx, req, nil)
+	it, err := b.submit(ctx, req, nil, true)
 	if err != nil {
 		return zero, err
 	}
@@ -317,7 +341,7 @@ func (b *Batcher[Req, Res]) Do(ctx context.Context, req Req) (Res, error) {
 // ErrClosed；WithMaxPending 满时返回 ErrOverloaded。写路径（日志/
 // 埋点/消息队列 producer）与读路径共享同一 Batcher 与观测口径。
 func (b *Batcher[Req, Res]) Enqueue(ctx context.Context, req Req) error {
-	_, err := b.submit(ctx, req, nil)
+	_, err := b.submit(ctx, req, nil, false)
 	return err
 }
 
@@ -329,14 +353,17 @@ func (b *Batcher[Req, Res]) Enqueue(ctx context.Context, req Req) error {
 // 本回调所在批占用：MaxConcurrency=1 下自死锁，>1 下阻塞所在批的剩余
 // 交付；需再入时先转到自有 goroutine 或队列。cb 为 nil 等价 Enqueue。
 func (b *Batcher[Req, Res]) EnqueueFunc(ctx context.Context, req Req, cb func(res Res, err error)) error {
-	_, err := b.submit(ctx, req, cb)
+	_, err := b.submit(ctx, req, cb, false)
 	return err
 }
 
 // submit 是 Do / Enqueue / EnqueueFunc 共用的提交路径：准入、构造
 // Item、入队握手——admit 计数口径因此结构性涵盖全部提交。返回已入队
-// 的 Item 供 Do 继续等待交付；fire-and-forget 调用方直接忽略。
-func (b *Batcher[Req, Res]) submit(ctx context.Context, req Req, cb func(res Res, err error)) (*item[Req, Res], error) {
+// 的 Item 供 Do 继续等待交付；fire-and-forget 调用方直接忽略。waited
+// 标记来源是否同步等待结果（仅 Do 为 true），交付点据此旁查 caller
+// ctx 取消并发 OnItemDiscarded——cb 与 waited 必须分开传：Do 与 Enqueue
+// 的 cb 同为 nil，来源只能由 waited 区分。
+func (b *Batcher[Req, Res]) submit(ctx context.Context, req Req, cb func(res Res, err error), waited bool) (*item[Req, Res], error) {
 	select {
 	case <-b.closing:
 		return nil, ErrClosed
@@ -350,6 +377,8 @@ func (b *Batcher[Req, Res]) submit(ctx context.Context, req Req, cb func(res Res
 		arrivedAt: time.Now(),
 		resCh:     make(chan delivery[Res], 1),
 		cb:        cb,
+		callerCtx: ctx,
+		waited:    waited,
 	}
 	select {
 	case b.inbox <- it:
@@ -426,13 +455,15 @@ func (b *Batcher[Req, Res]) run() {
 			return
 		}
 		formationStart := time.Now()
-		batch, ferr := b.collect(first)
+		batch, trigger, ferr := b.collect(first)
 		// WaitSeconds 在成批处结算（口径：首条 Item 入批 → Flush 触发），
-		// 槽位排队发生在结算之后，不污染组批耗时。
+		// 槽位排队发生在结算之后，不污染组批耗时。序号在成批处领发。
 		job := batchJob[Req, Res]{
 			batch:       batch,
 			waitSeconds: time.Since(formationStart).Seconds(),
 			presetErr:   ferr,
+			seq:         b.batchSeq.Add(1),
+			trigger:     trigger,
 		}
 		if b.stopped() {
 			b.flushAndAwait(job)
@@ -459,35 +490,43 @@ func (b *Batcher[Req, Res]) launch(job batchJob[Req, Res]) {
 
 // flushAndAwait 完成关闭路径的收尾：drain 剩余停靠 Item 并入末批
 // （仅有数据才 flush——关闭 flush 无条件），移交执行后等待全部在途
-// goroutine。返回即全部已入队 Waiter 已被唤醒、批次函数不再运行。
+// goroutine。收尾批的触发条件一律记 close、序号在此处领发（正常路径
+// 成批的 job 已带序号，不重复领取）。返回即全部已入队 Waiter 已被
+// 唤醒、批次函数不再运行。
 func (b *Batcher[Req, Res]) flushAndAwait(job batchJob[Req, Res]) {
 	job.batch = b.drain(job.batch)
 	if len(job.batch) > 0 {
+		if job.seq == 0 {
+			job.seq = b.batchSeq.Add(1)
+		}
+		job.trigger = TriggerClose
 		b.launch(job)
 	}
 	b.workers.Wait()
 }
 
 // collect 自首条 Item 起组批：条数达上限、字节达上限或 interval 到期
-// 先到先止；shutdown 亦立即止，交由调用方 drain。首条即满批或即超限
-// 时无需计时器。字节按原始条目累计（折叠发生在交付边界，重复 Item
-// 照常占槽计费）；sizeFn panic 或负数返回时整批预置失败、不调批次
-// 函数（组批运行于 dispatcher goroutine，无人 recover 会打穿
-// dispatcher、进程崩溃）。drain 路径不计字节——关闭 flush 无条件。
-func (b *Batcher[Req, Res]) collect(first *item[Req, Res]) ([]*item[Req, Res], error) {
-	batch := []*item[Req, Res]{first}
+// 先到先止，返回触发条件；shutdown 亦立即止，交由调用方 drain（触发
+// 条件由 flushAndAwait 改记 close）。首条即满批或即超限无需计时器。
+// 字节按原始条目累计（折叠发生在交付边界，重复 Item 照常占槽计费）；
+// sizeFn panic 或负数返回时整批预置失败、不调批次函数（组批运行于
+// dispatcher goroutine，无人 recover 会打穿 dispatcher、进程崩溃），
+// 触发条件记 bytes——失败发生在字节评估路径，具体错误随 presetErr 交付。
+// drain 路径不计字节——关闭 flush 无条件。
+func (b *Batcher[Req, Res]) collect(first *item[Req, Res]) (batch []*item[Req, Res], trigger FlushTrigger, ferr error) {
+	batch = []*item[Req, Res]{first}
 	if len(batch) >= b.maxSize {
-		return batch, nil
+		return batch, TriggerSize, nil
 	}
 	bytes := 0
 	if b.maxBytes > 0 {
 		n, err := b.sizeOf(first.req)
 		if err != nil {
-			return batch, err
+			return batch, TriggerBytes, err
 		}
 		bytes = n
 		if bytes >= b.maxBytes {
-			return batch, nil
+			return batch, TriggerBytes, nil
 		}
 	}
 	timer := time.NewTimer(b.interval)
@@ -499,20 +538,20 @@ func (b *Batcher[Req, Res]) collect(first *item[Req, Res]) ([]*item[Req, Res], e
 			if b.maxBytes > 0 {
 				n, err := b.sizeOf(it.req)
 				if err != nil {
-					return batch, err
+					return batch, TriggerBytes, err
 				}
 				bytes += n
 				if bytes >= b.maxBytes {
-					return batch, nil
+					return batch, TriggerBytes, nil
 				}
 			}
 		case <-timer.C:
-			return batch, nil
+			return batch, TriggerInterval, nil
 		case <-b.shutdown:
-			return batch, nil
+			return batch, TriggerClose, nil
 		}
 	}
-	return batch, nil
+	return batch, TriggerSize, nil
 }
 
 // sizeOf 评估条目字节量，仅配置 WithMaxBytes 时被调用（未配置零开销）。
@@ -542,11 +581,16 @@ func (b *Batcher[Req, Res]) drain(batch []*item[Req, Res]) []*item[Req, Res] {
 // execute 调用批次函数并按位置交付结果，随后记录观测。运行于执行
 // goroutine（在途槽位持有者），n > 1 时多个批次可并发进入本函数，
 // Observer / per-item 回调随之并发（契约要求并发安全）。
+// 入口先发 OnFlushStart（批次进入执行，与 OnBatchFlushed 以 job.seq
+// 配对，组批期预置失败的批同样成对）。
 // job.waitSeconds 为组批耗时口径（首条 Item 入批 → Flush 触发，成批处
 // 结算，不含槽位排队）；job.presetErr 非 nil 表示组批阶段已失败（sizeFn
 // panic 或负数返回），整批直接以此错误交付、不调批次函数（UniqueSize
-// 为 0，与折叠前失败口径一致）。
+// 为 0，与折叠前失败口径一致）。交付点旁查 Do 来源 Item 的 caller ctx：
+// 已取消即发 OnItemDiscarded 并计 discarded_items（结果无人读取的近似
+// 信号，不改交付语义）。
 func (b *Batcher[Req, Res]) execute(job batchJob[Req, Res]) {
+	b.emitFlushStart(FlushStartEvent{Seq: job.seq})
 	batch := job.batch
 	reqs := make([]Req, len(batch))
 	for i, it := range batch {
@@ -558,10 +602,13 @@ func (b *Batcher[Req, Res]) execute(job batchJob[Req, Res]) {
 	var uniqueSize int
 	var err error
 	var retries int
+	var panicVal any
+	var panicStack []byte
 	if job.presetErr != nil {
 		err = job.presetErr // 组批阶段已失败：不调批次函数
 	} else {
-		res, uniqueSize, err = b.callBatch(reqs)
+		var pc *panicCapture
+		res, uniqueSize, pc, err = b.callBatch(reqs)
 		// 批次级重试：仅哨兵错误按原 reqs 重执行（keyed 批含折叠），
 		// 其他错误照常广播。重试与退避在执行 goroutine 持槽进行，
 		// DurationSeconds / wait_seconds / 在途占用均覆盖全过程。
@@ -574,7 +621,10 @@ func (b *Batcher[Req, Res]) execute(job batchJob[Req, Res]) {
 			if b.metrics != nil {
 				b.metrics.batchRetries.Inc()
 			}
-			res, uniqueSize, err = b.callBatch(reqs)
+			res, uniqueSize, pc, err = b.callBatch(reqs)
+		}
+		if pc != nil {
+			panicVal, panicStack = pc.value, pc.stack
 		}
 	}
 	durationSeconds := time.Since(started).Seconds()
@@ -591,6 +641,15 @@ func (b *Batcher[Req, Res]) execute(job batchJob[Req, Res]) {
 		}
 		if b.metrics != nil {
 			b.metrics.waitSeconds.Observe(time.Since(it.arrivedAt).Seconds())
+		}
+		if it.waited && it.callerCtx.Err() != nil {
+			// Do 来源且交付时 caller ctx 已取消：结果无人读取的近似
+			// 信号（waiter 侧 resCh/ctx.Done 双就绪随机选择，个别结果
+			// 实际被读走）。仅旁路观测，不改交付语义。
+			if b.metrics != nil {
+				b.metrics.discardedItems.Inc()
+			}
+			b.emitItemDiscarded(ItemDiscardedEvent{BatchSize: len(batch)})
 		}
 	}
 
@@ -610,6 +669,10 @@ func (b *Batcher[Req, Res]) execute(job batchJob[Req, Res]) {
 		DurationSeconds: durationSeconds,
 		Retries:         retries,
 		Err:             err,
+		Seq:             job.seq,
+		Trigger:         job.trigger,
+		Panic:           panicVal,
+		Stack:           panicStack,
 	})
 }
 
@@ -630,18 +693,18 @@ func (b *Batcher[Req, Res]) backoffFor(attempt int) (err error) {
 
 // callBatch 执行一批：keyed 批先折叠为去重切片再调用批次函数，结果
 // 回填至原始位置（同 key Waiter 共享同一条结果）；长度契约（ADR-0001）
-// 对去重切片成立。返回去重后条数供事件口径；折叠失败（keyFn panic）
-// 时为 0。
-func (b *Batcher[Req, Res]) callBatch(reqs []Req) (res []Res, uniqueSize int, err error) {
+// 对去重切片成立。返回去重后条数供事件口径，pc 为批次函数 panic 现场
+// （无 panic 为 nil）；折叠失败（keyFn panic）时条数为 0、pc 为 nil。
+func (b *Batcher[Req, Res]) callBatch(reqs []Req) (res []Res, uniqueSize int, pc *panicCapture, err error) {
 	unique := reqs
 	var scatter func([]Res) []Res
 	if b.fold != nil {
 		unique, scatter, err = b.fold(reqs)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 	}
-	res, err = b.callFn(unique)
+	res, err, pc = b.callFn(unique)
 	// 长度契约：结果与请求不等长视为整批失败。
 	if err == nil && len(res) != len(unique) {
 		err = fmt.Errorf("batcher: batch function returned %d results for %d requests", len(res), len(unique))
@@ -649,13 +712,23 @@ func (b *Batcher[Req, Res]) callBatch(reqs []Req) (res []Res, uniqueSize int, er
 	if err == nil && scatter != nil {
 		res = scatter(res)
 	}
-	return res, len(unique), err
+	return res, len(unique), pc, err
 }
 
-// callFn 调用用户批次函数，panic 降级为 Batch Error，保证库继续可用。
-func (b *Batcher[Req, Res]) callFn(reqs []Req) (res []Res, err error) {
-	defer recoverAsBatchError("batch function", &err)
-	return b.fn(b.baseCtx, reqs)
+// callFn 调用用户批次函数，panic 降级为 Batch Error 并捕获现场
+// （panic 值与 recover 点调用栈）随 BatchFlushedEvent 旁路输出——堆栈
+// 仅此处捕获：下游偶发崩溃的 primary 诊断信号；key / size / backoff
+// 函数的 panic 只保留 Err 中的错误信息（同款降级，见
+// recoverAsBatchError）。
+func (b *Batcher[Req, Res]) callFn(reqs []Req) (res []Res, err error, pc *panicCapture) {
+	defer func() {
+		if r := recover(); r != nil {
+			pc = &panicCapture{value: r, stack: debug.Stack()}
+			err = fmt.Errorf("batcher: batch function panicked: %v", r)
+		}
+	}()
+	res, err = b.fn(b.baseCtx, reqs)
+	return
 }
 
 func (b *Batcher[Req, Res]) stopped() bool {
@@ -690,8 +763,16 @@ func (b *Batcher[Req, Res]) emitCreated() {
 	})
 }
 
+func (b *Batcher[Req, Res]) emitFlushStart(ev FlushStartEvent) {
+	b.safeEmit(func(o Observer) { o.OnFlushStart(ev) })
+}
+
 func (b *Batcher[Req, Res]) emitFlushed(ev BatchFlushedEvent) {
 	b.safeEmit(func(o Observer) { o.OnBatchFlushed(ev) })
+}
+
+func (b *Batcher[Req, Res]) emitItemDiscarded(ev ItemDiscardedEvent) {
+	b.safeEmit(func(o Observer) { o.OnItemDiscarded(ev) })
 }
 
 func (b *Batcher[Req, Res]) emitClosed() {
