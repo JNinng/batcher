@@ -18,7 +18,7 @@
 - **批次重试**：`WithRetry(n, backoff)` 对批次函数以 `ErrRetryable` 哨兵标记的瞬时故障整批按原请求重执行（含退避，持槽进行），至多 n 次；其他错误照常广播——不重试的默认语义不变。
 - **取消不改变批次形状**：调用方取消仅解除自身等待，其 Item 保留照常执行、结果丢弃；批次的 size 与对位绝不因取消而变化。
 - **优雅关闭**：`Close` 立即 flush 未满批并等待在途批次完成，正常返回即全部已入队 Waiter 已被唤醒；幂等、可并发调用。
-- **旁路可观测**：类型化 `Observer` 事件、`observ.Meter` 指标、结构化日志；Observer 与 Meter 默认 Noop，日志未注入时构造期快照 `observ.DefaultLogger()`。
+- **旁路可观测**：类型化 `Observer` 事件覆盖批次生命周期（进入执行、批完成含触发条件/批序号/panic 现场、条目丢弃、关闭）、`observ.Meter` 指标、结构化日志；Observer 与 Meter 默认 Noop，日志未注入时构造期快照 `observ.DefaultLogger()`。
 
 ## 安装
 
@@ -111,15 +111,19 @@ go run ./examples/sharded
 
 ## 可观测性
 
-**Observer**（类型化旁路事件，回调同步执行、必须快速返回：`OnBatchFlushed` 在执行 goroutine，`OnClosed` 在全部在途批次完成后的收尾段；回调可能并发——`WithMaxConcurrency(n>1)` 的多个执行 goroutine，或多个 Batcher（如路由层分片）共用同一 Observer——实现必须并发安全、跨批事件顺序不保证；回调 panic 会被库 recover；回调内不得同步再入本 Batcher）：
+**Observer**（类型化旁路事件，回调同步执行、必须快速返回：`OnFlushStart` / `OnItemDiscarded` / `OnBatchFlushed` 在执行 goroutine（持槽期间），`OnClosed` 在全部在途批次完成后的收尾段；回调可能并发——`WithMaxConcurrency(n>1)` 的多个执行 goroutine，或多个 Batcher（如路由层分片）共用同一 Observer——实现必须并发安全、跨批事件顺序不保证；回调 panic 会被库 recover；回调内不得同步再入本 Batcher）：
 
 ```go
 type Observer interface {
-	OnCreated(CreatedEvent)        // 构造时触发一次
-	OnBatchFlushed(BatchFlushedEvent) // 每批一次：Size / UniqueSize / WaitSeconds / DurationSeconds / Retries / Err
-	OnClosed(ClosedEvent)          // 全部在途批次完成后触发一次
+	OnCreated(CreatedEvent)             // 构造时触发一次
+	OnFlushStart(FlushStartEvent)       // 每批一次：进入执行、批次函数调用前（组批期失败的批同样触发）
+	OnBatchFlushed(BatchFlushedEvent)   // 每批一次：Size / UniqueSize / WaitSeconds / DurationSeconds / Retries / Err / Seq / Trigger / Panic / Stack
+	OnItemDiscarded(ItemDiscardedEvent) // 每条一次：交付时 caller ctx 已取消的 Do 来源 Item
+	OnClosed(ClosedEvent)               // 全部在途批次完成后触发一次
 }
 ```
+
+`OnFlushStart` 与 `OnBatchFlushed` 以批序号 `Seq`（Batcher 内自 1 单调递增，跨 Batcher 不唯一）恒成对，每批恰一对——n>1 交错回调下靠 Seq 配对；`Trigger` 报告 Flush 触发条件（`size` / `bytes` / `interval` / `close`，Close 路径含组批中途截断的批）；`Panic` / `Stack` 仅批次函数 panic 降级的批非 nil（recover 原值与 recover 点调用栈，key / size / backoff 函数的 panic 只保留 Err 信息）；`OnItemDiscarded` 是近似信号——口径为「交付时 caller ctx 已取消」，个别被判丢弃的结果在 waiter 侧 select 双就绪时实际被读走，fire-and-forget 来源不触发。
 
 **指标**（注入 `observ.Meter` 后启用，命名遵循 `_total` / `_seconds` / `_depth` 约定；Meter 实现不得 panic（库不做 recover）且必须并发安全——`WithMaxConcurrency(n>1)` 或路由层分片下埋点从多个 goroutine 并发发生）：
 
@@ -133,6 +137,7 @@ type Observer interface {
 | `batcher_queue_depth` | Gauge | 已准入未交付的提交数，含停泊在握手的发送方（批边界刷新） |
 | `batcher_overloaded_total` | Counter | 被 `WithMaxPending` 卸载拒绝的提交数 |
 | `batcher_batch_retries_total` | Counter | `WithRetry` 触发的重试执行次数（不含首次执行） |
+| `batcher_discarded_items_total` | Counter | 交付时 caller ctx 已取消的 Do 来源 Item 数（结果无人读取的近似信号） |
 
 ## 设计文档
 
@@ -148,5 +153,6 @@ type Observer interface {
 - [0008 下游并发上限：WithMaxConcurrency 与组批/执行流水线](docs/adr/0008-max-concurrency.md)
 - [0009 分片 Batcher：独立包 sharded，工厂按分片构造](docs/adr/0009-sharded-batcher.md)
 - [0010 批次重试策略：WithRetry 与 ErrRetryable 哨兵](docs/adr/0010-batch-retry.md)
+- [0011 观测旁路扩展：FlushStart、Trigger、Panic 与 ItemDiscarded](docs/adr/0011-observability-hooks.md)
 
-`New` 不做批内去重；`NewKeyed` 提供批内 key 去重，「key 相同 ⇒ 语义等价」由 key 函数声明（ADR 0004）；`NewKeyedMap` 在其上提供 map 回查与逐条缺失表示（ADR 0005）；`Enqueue`/`EnqueueFunc` 提供 fire-and-forget 入队（ADR 0006）；`WithMaxConcurrency` 放宽下游并发上限并流水线化组批与执行（ADR 0008）；路由层在独立子包 [sharded](sharded)——`sharded.New` 把请求分发给 n 个独立分片 Batcher（ADR 0009）；`WithRetry` 以 `ErrRetryable` 哨兵启用批次级重试（ADR 0010）。
+`New` 不做批内去重；`NewKeyed` 提供批内 key 去重，「key 相同 ⇒ 语义等价」由 key 函数声明（ADR 0004）；`NewKeyedMap` 在其上提供 map 回查与逐条缺失表示（ADR 0005）；`Enqueue`/`EnqueueFunc` 提供 fire-and-forget 入队（ADR 0006）；`WithMaxConcurrency` 放宽下游并发上限并流水线化组批与执行（ADR 0008）；路由层在独立子包 [sharded](sharded)——`sharded.New` 把请求分发给 n 个独立分片 Batcher（ADR 0009）；`WithRetry` 以 `ErrRetryable` 哨兵启用批次级重试（ADR 0010）；旁路观测覆盖批次生命周期——`OnFlushStart`/`OnBatchFlushed` 以批序号配对，flushed 事件携带触发条件与 panic 现场，`OnItemDiscarded` 近似报告无人读取的结果（ADR 0011）。
