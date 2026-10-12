@@ -10,7 +10,7 @@
 //     ≤ n：组批与执行重叠，成批后在执行入口排队等空闲槽位，缓解慢
 //     下游的队头阻塞；
 //   - 准入可有界（WithMaxPending）：已准入未交付的提交数达上限即负载
-//     卸载，新 Do 立即返回 ErrOverloaded，避免 goroutine 无界堆积；
+//     卸载，新提交立即返回 ErrOverloaded，避免 goroutine 无界堆积；
 //   - 批内可按 key 去重（NewKeyed）：批次函数收到去重切片，同 key 的
 //     Waiter 共享同一条执行；折叠发生在交付边界，重复 Item 照常占槽
 //     触发 Flush；
@@ -44,7 +44,7 @@ import (
 // 返回与入参等长的结果切片；返回非 nil 错误即整批失败。
 type BatchFunc[Req, Res any] func(ctx context.Context, reqs []Req) ([]Res, error)
 
-// ErrClosed 表示 Close 已开始后到达的新 Do 调用。
+// ErrClosed 表示 Close 已开始后到达的新提交被拒绝、未入队。
 var ErrClosed = errors.New("batcher: closed")
 
 // ErrOverloaded 表示负载卸载：WithMaxPending 上限已满，提交被拒绝、
@@ -102,7 +102,7 @@ type Batcher[Req, Res any] struct {
 	backoffFn      func(attempt int) time.Duration // 第 attempt 次重试前的退避，maxRetries > 0 时必设
 
 	inbox    chan *item[Req, Res] // 无缓冲：在途槽位占满期间新 Item 停靠在此；停泊发送方已过准入，计入 admitted
-	closing  chan struct{}        // Close 已开始，新 Do 立即 ErrClosed
+	closing  chan struct{}        // Close 已开始，新提交立即 ErrClosed
 	shutdown chan struct{}        // 唤醒 dispatcher：flush 后退出
 	done     chan struct{}        // dispatcher 已退出（含全部在途执行完成）
 

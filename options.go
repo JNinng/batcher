@@ -37,7 +37,7 @@ func WithInterval(d time.Duration) Option {
 }
 
 // WithMaxPending 设置已准入未交付提交数上限，实施负载卸载：达上限后
-// 新 Do 立即返回 ErrOverloaded，不入队、不堆积 goroutine。准入采用
+// 新提交立即返回 ErrOverloaded，不入队、不堆积 goroutine。准入采用
 // Add-then-check（原子加一后比较自身返回值），已准入未交付提交数恒
 // 不超过 n；上限的软性仅在于并发竞争下的计数瞬时虚高（其他提交的
 // 拒绝尚未回滚），额度尚空的提交可能被假阳性提前拒绝。Formation 与
