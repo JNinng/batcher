@@ -23,7 +23,7 @@ ADR-0002 预留的口子（「真有吞吐瓶颈时再加 MaxConcurrency 选项�
 
 交付侧语义原样随 worker 迁移：交付序、per-item 回调先于该批 `OnBatchFlushed`、准入额度逐条递减、批边界 gauge 刷新都仍在 execute 内完成，单批内部的顺序与口径零改动。`WaitSeconds`（组批耗时）在成批处结算后随批移交——口径为首条 Item 入批 → Flush 触发，**不含槽位排队时间**，与 ADR-0002/0007 的「组批耗时」声明一致（若在执行入口结算，排队批的组批耗时会被等待时间污染，静默破坏口径）；槽位排队计入的是端到端 `batcher_wait_seconds` 直方图与执行开始延迟。跨批层面两点契约更新：n>1 时多个执行 goroutine 可并发回调，Observer 实现必须并发安全、跨批事件顺序不保证（EnqueueFunc 的 per-item 回调天然独立，无此要求）；「回调不得同步再入本 Batcher」规则保留、机制描述更新——再入提交需等槽位而槽位正被本回调所在批占用，MaxConcurrency=1 下自死锁、>1 下阻塞所在批的剩余交付。Meter 实现的并发安全要求同步写明（同 Observer 契约，n>1 下埋点多 goroutine 并发发生）。
 
-Close 语义保持：`flushRemainder`（drain 并入末批、仅有数据才 flush）移交执行后等待全部在途 goroutine 归零——正常返回即全部 Waiter 已被唤醒、批次函数不再运行；baseCtx 在全部 worker 退出后才取消，ADR-0003 的 ctx 生命周期契约不变。queue_depth 仍为批边界刷新的近似值，n>1 时并发交付下采样可能瞬时乱序（陈旧值短暂回弹），下一批边界自校正。
+Close 语义保持：`flushAndAwait`（drain 并入末批、仅有数据才 flush）移交执行后等待全部在途 goroutine 归零——正常返回即全部 Waiter 已被唤醒、批次函数不再运行；baseCtx 在全部 worker 退出后才取消，ADR-0003 的 ctx 生命周期契约不变。queue_depth 仍为批边界刷新的近似值，n>1 时并发交付下采样可能瞬时乱序（陈旧值短暂回弹），下一批边界自校正。
 
 ## Consequences
 

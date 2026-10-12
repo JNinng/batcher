@@ -10,7 +10,7 @@
 - **先到先触发**：批大小上限、批字节上限或时间间隔（自组批起算）先到先触发 Flush；仅有数据才触发，批次函数永远不会收到空切片。
 - **可配置下游并发**：默认串行单在途（下游并发 1，行为可预测）；`WithMaxConcurrency(n)` 放宽至同一时刻至多 n 个批次在途，组批与执行重叠——慢批次不再令后续批次空等，缓解队头阻塞。计数单位是批次而非条目。
 - **分片 Batcher**（[sharded 子包](sharded)）：`sharded.New(route, n, factory)` 把并发请求按路由函数分发给 n 个独立组批、独立执行的分片（Redis cluster、分库分表），工厂以 shard 下标按分片选连接；内置工厂与 `NewKeyed` / `NewKeyedMap` 组合（前提「同 key ⇒ 同分片」），`Close` 级联关闭全部分片。
-- **有界队列 + 负载卸载**：`WithMaxPending(n)` 限制已准入未交付的提交数（含停泊在握手上的发送方），达上限新 `Do` 立即返回 `ErrOverloaded`，避免 goroutine 无界堆积。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝。
+- **有界队列 + 负载卸载**：`WithMaxPending(n)` 限制已准入未交付的提交数（含停泊在握手上的发送方），达上限新提交立即返回 `ErrOverloaded`，避免 goroutine 无界堆积。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝。
 - **批内 key 去重**：`NewKeyed` 把同 key 的并发请求折叠为一次执行——批次函数收到去重切片（首次出现序），同 key 的 Waiter 共享结果；maxSize 仍按原始条数计数，事件双口径 `Size` / `UniqueSize`。
 - **逐条结果 / 错误**：`Result[Res]{Value, Err}` 让位置对位 API 逐条表达业务失败，结果切片仍等长；`NewKeyedMap` 是 keyed-map 变体，批次函数返回 `map[K]Res`，缺 key 转单条 `ErrMissingResult`、非整批失败。
 - **Fire-and-forget 入队**：`Enqueue` 提交即返回、不等待结果，写路径（日志/埋点/producer）与读路径共享同一组批与观测口径；`EnqueueFunc` 在交付点同步回调结果，回调 panic 由库 recover。
@@ -84,14 +84,14 @@ go run ./examples/sharded
 | --- | --- |
 | Flush 触发 | 批大小上限、批字节上限或时间间隔先到先触发；时间间隔自组批起点（第一条 Item 进入空批）起算，是尽力而为的软上限。空批不计时、不唤醒。字节按原始条目累计，单条即超限自成批大小 1 的孤批——不拆分、不丢弃。 |
 | 下游并发 | 默认恒为 1（串行单在途）；`WithMaxConcurrency(n)` 放宽至同一时刻批次函数在途（已 Flush 未返回）的批次 ≤ n。组批与执行重叠：批次函数执行期间后续批次照常组批，成批后在执行入口排队等空闲槽位（排队中的批尚未 Flush，不计入 n）；interval 仍自各批组批起点起算，成批先于槽位空出时槽位空出即执行。n>1 时多个执行 goroutine 可并发回调 Observer / per-item 回调，实现必须并发安全、跨批事件顺序不保证。 |
-| 负载卸载 | 配置 `WithMaxPending(n)` 后，已准入未交付的提交数达 n 即拒绝：新 `Do` 立即返回 `ErrOverloaded`，不入队。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝（其他提交的拒绝尚未回滚、计数瞬时虚高），被拒调用方可退避重试。Formation 与在途中的 Item 同样占用额度：批次大小恒不超过 n，n < MaxSize 时批大小触发不可达。未配置即无界。 |
+| 负载卸载 | 配置 `WithMaxPending(n)` 后，已准入未交付的提交数达 n 即拒绝：新提交立即返回 `ErrOverloaded`，不入队。已准入提交数恒不超过 n；并发竞争下额度尚空的提交仅可能被假阳性提前拒绝（其他提交的拒绝尚未回滚、计数瞬时虚高），被拒调用方可退避重试。Formation 与在途中的 Item 同样占用额度：批次大小恒不超过 n，n < MaxSize 时批大小触发不可达。未配置即无界。 |
 | 批内去重 | `NewKeyed(key, fn)` 在交付边界折叠同 key Item：批次函数收到去重切片（首次出现序，重复 key 只首达 Req 送达下游），`len(res) == len(unique)`，同 key 的 Waiter 共享同一条执行、各自取得一份结果。「key 相同 ⇒ 语义等价」由 key 函数的提供方声明。maxSize 按原始条数计数，重复照常占槽触发 Flush；跨批去重不做，执行期到达的重复 key 落入下一批重查；key 函数 panic 降级为批级错误、库继续可用。 |
 | 批级错误 | 批次函数返回非 nil 错误、panic、或结果长度与请求不符，整批所有 Waiter 收到同一错误。单条业务失败见「逐条失败」。 |
 | 批次重试 | `WithRetry(n, backoff)`：批次函数返回 `errors.Is(err, ErrRetryable)` 的错误（如 `fmt.Errorf("503: %w", ErrRetryable)`）时整批按原请求重执行至多 n 次（keyed 批含折叠），其他错误照常广播；未配置时哨兵也不启用重试。重试与退避在执行 goroutine 持槽进行、计入 `DurationSeconds` 与 `wait_seconds`，事件 `Retries` 字段与 `batcher_batch_retries_total` 可观测。退避由你实现（attempt 从 1 起），panic 或负数返回即该批失败。交互：MaxConcurrency=1 时退避把队头阻塞放大为全库停摆，建议搭配 `WithMaxConcurrency ≥ 2`；与 MaxPending 叠加时退避窗口内新提交可能集中被卸载。 |
 | 逐条失败 | `Result[Res]{Value, Err}` 在位置对位 API 下逐条表达业务失败（结果切片仍等长），库不解读 Result：批级失败看 `Do` 的 error，逐条失败看 `Result.Err`。`NewKeyedMap(key, fn)` 在 NewKeyed 折叠之上回查 `map[K]Res`：缺 key 转 `Result{Err: ErrMissingResult}`（单条缺失，非整批失败），多余 key 忽略；key 函数在折叠与回查各调一次，须为纯函数。 |
 | fire-and-forget | `Enqueue(ctx, req)` 提交即返回（nil = 已入队）：Item 与 `Do` 来源一视同仁地组批、执行、计入观测与准入额度，结果无人读取。ctx 只治理本次提交——取消或 Close 即返回 `ctx.Err()` / `ErrClosed` 且不入队；握手完成后再无取消语义。`EnqueueFunc` 附加 per-item 回调：交付点同步执行（先于该批 `OnBatchFlushed`）、必须快速返回、panic 由库 recover；批级失败回调收到同一 Batch Error，cb 为 nil 等价 `Enqueue`。回调内不得同步再入本 Batcher（再入提交需等槽位而槽位正被本回调所在批占用，下游并发 1 下自死锁）。 |
 | 调用方取消 | `Do` 的 ctx 取消即返回 `ctx.Err()`：入队握手前取消则 Item 不入队，已入队后取消仅解除等待，Item 保留在批中照常执行、结果丢弃。批次函数运行于 batcher 级基础 ctx，不携带任何单个调用方的 deadline。 |
-| Close | 先到达的 Do 立即返回 `ErrClosed`；`Close(ctx)` flush 未满批并等待在途批次完成后才返回，ctx 超时仅放弃等待（后台 flush 照常完成），返回 `ctx.Err()`。 |
+| Close | 先到达的新提交立即返回 `ErrClosed`；`Close(ctx)` flush 未满批并等待在途批次完成后才返回，ctx 超时仅放弃等待（后台 flush 照常完成），返回 `ctx.Err()`。 |
 
 ## 配置选项
 
