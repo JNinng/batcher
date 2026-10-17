@@ -734,7 +734,7 @@ func TestNextBatchStartsWhenFlushedAndSlotBothReady(t *testing.T) {
 // WithMaxPending：额度满员时新 Do 立即 ErrOverloaded；交付释放额度后
 // 恢复准入，被卸载的调用不占用批次、不影响在途批交付。
 func TestMaxPendingShedsWhenFull(t *testing.T) {
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
@@ -747,7 +747,7 @@ func TestMaxPendingShedsWhenFull(t *testing.T) {
 		batcher.WithMaxSize(1),
 		batcher.WithInterval(10*time.Millisecond),
 		batcher.WithMaxPending(2),
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 	)
 
 	d1 := make(chan int, 1)
@@ -795,10 +795,10 @@ func TestMaxPendingShedsWhenFull(t *testing.T) {
 	if err := b.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if v := m.counters["batcher_overloaded_total"].Value(); v != 2 {
+	if v := m.counterValue(t, "batcher_overloaded_total"); v != 2 {
 		t.Fatalf("batcher_overloaded_total = %v, want 2", v)
 	}
-	if v := m.gauges["batcher_queue_depth"].Value(); v != 0 {
+	if v := m.gaugeValue(t, "batcher_queue_depth"); v != 0 {
 		t.Fatalf("queue_depth = %v, want 0（额度全量释放）", v)
 	}
 }
@@ -806,7 +806,7 @@ func TestMaxPendingShedsWhenFull(t *testing.T) {
 // 并发风暴：准入上限下每个 Do 必以「正确结果 / ErrOverloaded」收场，
 // 绝不悬挂；卸载计数与实际拒绝数一致；额度最终全量释放。
 func TestMaxPendingConcurrentSheddingStorm(t *testing.T) {
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	release := make(chan struct{})
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
 		<-release // 首批阻塞在批次函数里，制造卸载窗口
@@ -818,7 +818,7 @@ func TestMaxPendingConcurrentSheddingStorm(t *testing.T) {
 		batcher.WithMaxSize(maxPending), // 满 5 条按 size 立即成批，不等 interval
 		batcher.WithInterval(10*time.Second),
 		batcher.WithMaxPending(maxPending),
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 	)
 
 	const n = 50
@@ -848,13 +848,13 @@ func TestMaxPendingConcurrentSheddingStorm(t *testing.T) {
 	if okCount < maxPending {
 		t.Fatalf("ok = %d, want >= %d（首批必须成批进入批次函数）", okCount, maxPending)
 	}
-	if v := m.counters["batcher_overloaded_total"].Value(); v != float64(n-okCount) {
+	if v := m.counterValue(t, "batcher_overloaded_total"); v != int64(n-okCount) {
 		t.Fatalf("batcher_overloaded_total = %v, want %d（与实际拒绝数一致）", v, n-okCount)
 	}
 	if err := b.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if v := m.gauges["batcher_queue_depth"].Value(); v != 0 {
+	if v := m.gaugeValue(t, "batcher_queue_depth"); v != 0 {
 		t.Fatalf("queue_depth = %v, want 0（额度全量释放）", v)
 	}
 }

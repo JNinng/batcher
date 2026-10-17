@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/jninng/batcher"
-	"github.com/jninng/observ"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 // recordingObserver 记录全部事件（回调必须并发安全）。
@@ -56,102 +58,93 @@ func (o *recordingObserver) OnClosed(e batcher.ClosedEvent) {
 	o.closed++
 }
 
-// fakeMeter 实现 observ.Meter 并记录观察值。
-type fakeCounter struct {
-	mu sync.Mutex
-	v  float64
+// testMeter 用 sdk/metric 的 ManualReader 承接真实仪表值断言：otel
+// 同步仪表接口密封（内嵌未导出标记方法，外部包不可实现），fake 至多
+// 落在 Meter 一侧且工厂仍须返回真实仪表；断言经 Collect 读取
+// metricdata——Counter 取累计 Sum、Gauge 取最新值、Histogram 取计数。
+type testMeter struct {
+	reader *sdkmetric.ManualReader
+	meter  metric.Meter
 }
 
-func (c *fakeCounter) Inc() { c.Add(1) }
-func (c *fakeCounter) Add(v float64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.v += v
-}
-func (c *fakeCounter) Value() float64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.v
+func newTestMeter(t *testing.T) *testMeter {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	return &testMeter{reader: reader, meter: provider.Meter("github.com/jninng/batcher")}
 }
 
-type fakeGauge struct {
-	mu      sync.Mutex
-	v       float64
-	history []float64
-}
-
-func (g *fakeGauge) Set(v float64) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.v = v
-	g.history = append(g.history, v)
-}
-func (g *fakeGauge) Value() float64 {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.v
-}
-func (g *fakeGauge) Add(v float64) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.v += v
-}
-func (g *fakeGauge) History() []float64 {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return append([]float64(nil), g.history...)
-}
-
-type fakeHistogram struct {
-	mu     sync.Mutex
-	values []float64
-}
-
-func (h *fakeHistogram) Observe(v float64) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.values = append(h.values, v)
-}
-func (h *fakeHistogram) Values() []float64 {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return append([]float64(nil), h.values...)
-}
-
-type fakeMeter struct {
-	mu        sync.Mutex
-	counters  map[string]*fakeCounter
-	gauges    map[string]*fakeGauge
-	histogram map[string]*fakeHistogram
-}
-
-func newFakeMeter() *fakeMeter {
-	return &fakeMeter{
-		counters:  map[string]*fakeCounter{},
-		gauges:    map[string]*fakeGauge{},
-		histogram: map[string]*fakeHistogram{},
+// find 返回名为 name 的指标快照；尚无任何记录（未打点）时 ok 为 false。
+func (m *testMeter) find(t *testing.T, name string) (metricdata.Metrics, bool) {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := m.reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
 	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, md := range sm.Metrics {
+			if md.Name == name {
+				return md, true
+			}
+		}
+	}
+	return metricdata.Metrics{}, false
 }
 
-func (m *fakeMeter) NewCounter(name, help string) observ.Counter {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.counters[name] = &fakeCounter{}
-	return m.counters[name]
+// counterValue 返回计数器累计和；「未打点」在累计语义下与「值为 0」等价。
+func (m *testMeter) counterValue(t *testing.T, name string) int64 {
+	t.Helper()
+	md, ok := m.find(t, name)
+	if !ok {
+		return 0
+	}
+	sum, ok := md.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("%s: 数据类型 %T, want Sum[int64]", name, md.Data)
+	}
+	var v int64
+	for _, dp := range sum.DataPoints {
+		v += dp.Value
+	}
+	return v
 }
 
-func (m *fakeMeter) NewGauge(name, help string) observ.Gauge {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.gauges[name] = &fakeGauge{}
-	return m.gauges[name]
+// gaugeValue 返回 gauge 最新采样值（采集时刻的即时读数）。与 counter
+// 不同，gauge 的「未打点」不与任何值等价——此处要求仪表已被批边界
+// 写入过（缺记录即失败），want 0 断言因此仍钉住「采样过且为 0」。
+func (m *testMeter) gaugeValue(t *testing.T, name string) int64 {
+	t.Helper()
+	md, ok := m.find(t, name)
+	if !ok {
+		t.Fatalf("%s: 尚无记录, want 至少一次批边界采样", name)
+	}
+	g, ok := md.Data.(metricdata.Gauge[int64])
+	if !ok {
+		t.Fatalf("%s: 数据类型 %T, want Gauge[int64]", name, md.Data)
+	}
+	var v int64
+	for _, dp := range g.DataPoints {
+		v = dp.Value
+	}
+	return v
 }
 
-func (m *fakeMeter) NewHistogram(name, help string, buckets []float64) observ.Histogram {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.histogram[name] = &fakeHistogram{}
-	return m.histogram[name]
+// histogram 返回直方图唯一数据点（无属性指标恒单点）。
+func (m *testMeter) histogram(t *testing.T, name string) metricdata.HistogramDataPoint[float64] {
+	t.Helper()
+	md, ok := m.find(t, name)
+	if !ok {
+		t.Fatalf("%s: 尚无记录", name)
+	}
+	h, ok := md.Data.(metricdata.Histogram[float64])
+	if !ok {
+		t.Fatalf("%s: 数据类型 %T, want Histogram[float64]", name, md.Data)
+	}
+	if len(h.DataPoints) != 1 {
+		t.Fatalf("%s: 数据点 %d 个, want 1", name, len(h.DataPoints))
+	}
+	return h.DataPoints[0]
 }
 
 func TestObserverReceivesLifecycleAndFlushEvents(t *testing.T) {
@@ -260,7 +253,7 @@ func (panicOnFlushObserver) OnItemDiscarded(batcher.ItemDiscardedEvent) {}
 func (panicOnFlushObserver) OnClosed(batcher.ClosedEvent)               {}
 
 func TestMetricsRecordedOnFlush(t *testing.T) {
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
 		return append([]int(nil), reqs...), nil
 	}
@@ -268,7 +261,7 @@ func TestMetricsRecordedOnFlush(t *testing.T) {
 	b := batcher.New[int, int](fn,
 		batcher.WithMaxSize(2),
 		batcher.WithInterval(10*time.Second),
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 	)
 	var wg sync.WaitGroup
 	for i := 1; i <= 2; i++ {
@@ -285,28 +278,31 @@ func TestMetricsRecordedOnFlush(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if v := m.counters["batcher_batch_total"].Value(); v != 1 {
+	if v := m.counterValue(t, "batcher_batch_total"); v != 1 {
 		t.Fatalf("batcher_batch_total = %v, want 1", v)
 	}
-	if v := m.counters["batcher_batch_failed_total"].Value(); v != 0 {
+	if v := m.counterValue(t, "batcher_batch_failed_total"); v != 0 {
 		t.Fatalf("batcher_batch_failed_total = %v, want 0", v)
 	}
-	if vs := m.histogram["batcher_batch_size"].Values(); len(vs) != 1 || vs[0] != 2 {
-		t.Fatalf("batcher_batch_size = %v, want [2]", vs)
+	dp := m.histogram(t, "batcher_batch_size")
+	if dp.Count != 1 || dp.Sum != 2 {
+		t.Fatalf("batcher_batch_size = (count %d, sum %v), want (1, 2)", dp.Count, dp.Sum)
 	}
-	if vs := m.histogram["batcher_batch_duration_seconds"].Values(); len(vs) != 1 || vs[0] < 0 {
-		t.Fatalf("batcher_batch_duration_seconds = %v, want one non-negative", vs)
+	dp = m.histogram(t, "batcher_batch_duration_seconds")
+	if dp.Count != 1 || dp.Sum < 0 {
+		t.Fatalf("batcher_batch_duration_seconds = (count %d, sum %v), want 一次非负耗时", dp.Count, dp.Sum)
 	}
-	if vs := m.histogram["batcher_wait_seconds"].Values(); len(vs) != 2 {
-		t.Fatalf("batcher_wait_seconds = %v（每条 Item 一次）, want 2 次", vs)
+	dp = m.histogram(t, "batcher_wait_seconds")
+	if dp.Count != 2 {
+		t.Fatalf("batcher_wait_seconds count = %d（每条 Item 一次）, want 2", dp.Count)
 	}
-	if v := m.gauges["batcher_queue_depth"].Value(); v != 0 {
+	if v := m.gaugeValue(t, "batcher_queue_depth"); v != 0 {
 		t.Fatalf("batcher_queue_depth = %v, want 0（Close 后无积压）", v)
 	}
 }
 
 func TestMetricsRecordFailure(t *testing.T) {
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
 		return nil, errors.New("boom")
 	}
@@ -314,7 +310,7 @@ func TestMetricsRecordFailure(t *testing.T) {
 	b := batcher.New[int, int](fn,
 		batcher.WithMaxSize(1),
 		batcher.WithInterval(10*time.Millisecond),
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 	)
 	if _, err := b.Do(context.Background(), 1); err == nil {
 		t.Fatal("Do err = nil, want boom")
@@ -323,33 +319,18 @@ func TestMetricsRecordFailure(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if v := m.counters["batcher_batch_failed_total"].Value(); v != 1 {
+	if v := m.counterValue(t, "batcher_batch_failed_total"); v != 1 {
 		t.Fatalf("batcher_batch_failed_total = %v, want 1", v)
 	}
 }
 
-// recordsLogger 实现 observ.Logger 并记录输出。
-type recordsLogger struct {
-	mu      sync.Mutex
-	records []string
-}
-
-func (l *recordsLogger) Enabled(level slog.Level) bool { return true }
-func (l *recordsLogger) Log(level slog.Level, msg string, attrs ...slog.Attr) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.records = append(l.records, msg)
-}
-func (l *recordsLogger) Records() []string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return append([]string(nil), l.records...)
-}
-
-func TestLoggerDefaultsToObservDefaultSnapshot(t *testing.T) {
-	captured := &recordsLogger{}
-	old := observ.SetDefaultLogger(captured)
-	defer observ.SetDefaultLogger(old)
+// 约束：WithLogger 注入的 *slog.Logger 收到 created…closed 完整
+// 生命周期（构造期一次固定，构造后替换注入不追溯已建 Batcher）。
+// 未注入时的默认静默是构造性保证——构造期固定 discard logger、
+// 不存在输出路径，结构上不可观测，无（也无法有）测试断言。
+func TestWithLoggerReceivesLifecycleLogs(t *testing.T) {
+	var buf bytes.Buffer
+	captured := slog.New(slog.NewTextHandler(&buf, nil))
 
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
 		return append([]int(nil), reqs...), nil
@@ -357,15 +338,15 @@ func TestLoggerDefaultsToObservDefaultSnapshot(t *testing.T) {
 	b := batcher.New[int, int](fn,
 		batcher.WithMaxSize(1),
 		batcher.WithInterval(10*time.Millisecond),
+		batcher.WithLogger(captured),
 	)
 	if err := b.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	recs := captured.Records()
-	if len(recs) < 2 ||
-		recs[0] != "batcher: created" || recs[len(recs)-1] != "batcher: closed" {
-		t.Fatalf("log records = %v, want created…closed 生命周期", recs)
+	out := buf.String()
+	if !strings.Contains(out, "batcher: created") || !strings.Contains(out, "batcher: closed") {
+		t.Fatalf("log output = %q, want created…closed 生命周期", out)
 	}
 }
 
@@ -819,7 +800,7 @@ func TestFlushEventCapturesBatchFunctionPanic(t *testing.T) {
 // 旁路消费，不触发。
 func TestItemDiscardedOnCallerCancelOnly(t *testing.T) {
 	t.Run("do-cancelled-at-delivery", func(t *testing.T) {
-		m := newFakeMeter()
+		m := newTestMeter(t)
 		obs := &recordingObserver{}
 		entered := make(chan struct{})
 		release := make(chan struct{})
@@ -831,7 +812,7 @@ func TestItemDiscardedOnCallerCancelOnly(t *testing.T) {
 			batcher.WithMaxSize(1),
 			batcher.WithInterval(10*time.Second),
 			batcher.WithObserver(obs),
-			batcher.WithMeter(m),
+			batcher.WithMeter(m.meter),
 		)
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
@@ -853,19 +834,19 @@ func TestItemDiscardedOnCallerCancelOnly(t *testing.T) {
 		if len(obs.discarded) != 1 || obs.discarded[0].BatchSize != 1 {
 			t.Fatalf("discarded = %+v, want 一条 {BatchSize:1}", obs.discarded)
 		}
-		if v := m.counters["batcher_discarded_items_total"].Value(); v != 1 {
+		if v := m.counterValue(t, "batcher_discarded_items_total"); v != 1 {
 			t.Fatalf("batcher_discarded_items_total = %v, want 1", v)
 		}
 	})
 
 	t.Run("enqueue-never-discarded", func(t *testing.T) {
-		m := newFakeMeter()
+		m := newTestMeter(t)
 		obs := &recordingObserver{}
 		b := batcher.New[int, int](identityFn,
 			batcher.WithMaxSize(2), // 与 Do 来源同批交付
 			batcher.WithInterval(10*time.Second),
 			batcher.WithObserver(obs),
-			batcher.WithMeter(m),
+			batcher.WithMeter(m.meter),
 		)
 		ctx, cancel := context.WithCancel(context.Background())
 		if err := b.Enqueue(ctx, 1); err != nil { // 握手后 ctx 取消：结果本就无人读取
@@ -884,7 +865,7 @@ func TestItemDiscardedOnCallerCancelOnly(t *testing.T) {
 		if len(obs.discarded) != 0 {
 			t.Fatalf("discarded = %+v, want 空（fire-and-forget 不参与）", obs.discarded)
 		}
-		if v := m.counters["batcher_discarded_items_total"].Value(); v != 0 {
+		if v := m.counterValue(t, "batcher_discarded_items_total"); v != 0 {
 			t.Fatalf("batcher_discarded_items_total = %v, want 0", v)
 		}
 	})

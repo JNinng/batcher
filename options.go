@@ -1,9 +1,10 @@
 package batcher
 
 import (
+	"log/slog"
 	"time"
 
-	"github.com/jninng/observ"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Option 定制 Batcher 构造参数；MaxSize 与 Interval 必填。
@@ -21,8 +22,8 @@ type config struct {
 	maxRetries     int
 	backoffFn      func(attempt int) time.Duration // 第 attempt 次重试前的退避时长
 	observer       Observer
-	meter          observ.Meter
-	logger         observ.Logger
+	meter          metric.Meter
+	logger         *slog.Logger
 }
 
 // WithMaxSize 设置批大小上限（Flush 触发条件之一），必须 > 0。
@@ -103,14 +104,15 @@ func WithObserver(o Observer) Option {
 	return func(c *config) { c.observer = o }
 }
 
-// WithMeter 注入指标 Meter，默认 Noop（NoopMeter 可比较，
-// 命中时库整体跳过埋点）。
-func WithMeter(m observ.Meter) Option {
+// WithMeter 注入 OTel 指标 Meter；未注入即不埋点（指标句柄集为 nil，
+// 提交与执行路径整体跳过打点）。仪表自构造时刻绑定 m 所属 provider
+// ——构造后替换全局 MeterProvider 不追溯已建 Batcher。
+func WithMeter(m metric.Meter) Option {
 	return func(c *config) { c.meter = m }
 }
 
-// WithLogger 注入日志 Logger；未注入时构造期快照
-// observ.DefaultLogger() 并固定。
-func WithLogger(l observ.Logger) Option {
+// WithLogger 注入 *slog.Logger；未注入时构造期固定为 discard logger
+// （默认静默，零输出——与未注入 Meter 不埋点同款缺省口径）。
+func WithLogger(l *slog.Logger) Option {
 	return func(c *config) { c.logger = l }
 }

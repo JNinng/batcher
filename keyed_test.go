@@ -212,7 +212,7 @@ func TestKeyedUniquePreservesFirstOccurrenceOrder(t *testing.T) {
 // 约束（与 WithMaxPending 组合）：准入按原始条数记账、折叠只发生在
 // 交付边界——重复 Item 各占一个额度、交付时各自释放，额度不得泄漏。
 func TestKeyedWithMaxPendingAdmissionDrainsToZero(t *testing.T) {
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	var mu sync.Mutex
 	var calls [][]int
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
@@ -228,7 +228,7 @@ func TestKeyedWithMaxPendingAdmissionDrainsToZero(t *testing.T) {
 		batcher.WithMaxSize(4),
 		batcher.WithInterval(10*time.Second), // 占满即按 size 触发
 		batcher.WithMaxPending(4),
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 	)
 
 	const n = 4
@@ -256,10 +256,10 @@ func TestKeyedWithMaxPendingAdmissionDrainsToZero(t *testing.T) {
 	if err := b.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if v := m.counters["batcher_overloaded_total"].Value(); v != 0 {
+	if v := m.counterValue(t, "batcher_overloaded_total"); v != 0 {
 		t.Fatalf("batcher_overloaded_total = %v, want 0（4 条原始恰占满 4 额度）", v)
 	}
-	if v := m.gauges["batcher_queue_depth"].Value(); v != 0 {
+	if v := m.gaugeValue(t, "batcher_queue_depth"); v != 0 {
 		t.Fatalf("queue_depth = %v, want 0（交付按原始条数释放额度）", v)
 	}
 }

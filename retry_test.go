@@ -22,7 +22,7 @@ func retryable(msg string) error {
 // reqs 重执行，成功后 Waiter 正常收结果；重试次数计入事件 Retries
 // 与 batcher_batch_retries_total（不含首次执行）。
 func TestRetryReplaysBatchOnSentinelError(t *testing.T) {
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	obs := &recordingObserver{}
 	var mu sync.Mutex
 	var calls [][]int
@@ -41,7 +41,7 @@ func TestRetryReplaysBatchOnSentinelError(t *testing.T) {
 		batcher.WithMaxSize(2),
 		batcher.WithInterval(10*time.Second), // 两条占满即触发，隔离 interval
 		batcher.WithRetry(3, func(attempt int) time.Duration { return time.Millisecond }),
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 		batcher.WithObserver(obs),
 	)
 	defer func() {
@@ -75,10 +75,10 @@ func TestRetryReplaysBatchOnSentinelError(t *testing.T) {
 			t.Fatalf("calls[%d] = %v, want 整批重放（原 reqs，不缩水）", i, got)
 		}
 	}
-	if v := m.counters["batcher_batch_retries_total"].Value(); v != 2 {
+	if v := m.counterValue(t, "batcher_batch_retries_total"); v != 2 {
 		t.Fatalf("batcher_batch_retries_total = %v, want 2（不含首次执行）", v)
 	}
-	if v := m.counters["batcher_batch_total"].Value(); v != 1 {
+	if v := m.counterValue(t, "batcher_batch_total"); v != 1 {
 		t.Fatalf("batcher_batch_total = %v, want 1（重试不另计批次数）", v)
 	}
 	obs.mu.Lock()
@@ -91,7 +91,7 @@ func TestRetryReplaysBatchOnSentinelError(t *testing.T) {
 // 约束（耗尽广播）：重试 n 次仍失败即最后一次错误广播给全部 Waiter，
 // batch_failed_total 计一次（终态一次，非每次尝试）。
 func TestRetryExhaustionBroadcastsLastError(t *testing.T) {
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	boom := retryable("always-broken")
 	var calls atomic.Int64
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
@@ -103,7 +103,7 @@ func TestRetryExhaustionBroadcastsLastError(t *testing.T) {
 		batcher.WithMaxSize(1),
 		batcher.WithInterval(10*time.Millisecond),
 		batcher.WithRetry(2, func(attempt int) time.Duration { return time.Millisecond }),
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 	)
 	defer func() {
 		if err := b.Close(context.Background()); err != nil {
@@ -117,10 +117,10 @@ func TestRetryExhaustionBroadcastsLastError(t *testing.T) {
 	if c := calls.Load(); c != 3 {
 		t.Fatalf("fn calls = %d, want 3（首次 + 重试 2 次）", c)
 	}
-	if v := m.counters["batcher_batch_retries_total"].Value(); v != 2 {
+	if v := m.counterValue(t, "batcher_batch_retries_total"); v != 2 {
 		t.Fatalf("batcher_batch_retries_total = %v, want 2", v)
 	}
-	if v := m.counters["batcher_batch_failed_total"].Value(); v != 1 {
+	if v := m.counterValue(t, "batcher_batch_failed_total"); v != 1 {
 		t.Fatalf("batcher_batch_failed_total = %v, want 1（终态一次）", v)
 	}
 }
@@ -233,14 +233,14 @@ func TestRetryBackoffPanicDegradesToBatchError(t *testing.T) {
 		return nil, retryable("flaky")
 	}
 
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	b := batcher.New[int, int](fn,
 		batcher.WithMaxSize(1),
 		batcher.WithInterval(10*time.Millisecond),
 		batcher.WithRetry(3, func(attempt int) time.Duration {
 			panic("backoff explodes")
 		}),
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 	)
 	defer func() {
 		if err := b.Close(context.Background()); err != nil {
@@ -264,7 +264,7 @@ func TestRetryBackoffPanicDegradesToBatchError(t *testing.T) {
 		t.Fatalf("fn calls = %d, want 2（后续批独立走完整重试路径）", c)
 	}
 	// 计数口径：退避失败的尝试未执行批次函数，不计入重试数。
-	if v := m.counters["batcher_batch_retries_total"].Value(); v != 0 {
+	if v := m.counterValue(t, "batcher_batch_retries_total"); v != 0 {
 		t.Fatalf("batcher_batch_retries_total = %v, want 0（退避失败不计重试）", v)
 	}
 }
@@ -302,7 +302,7 @@ func TestRetryBackoffNegativeDegradesToBatchError(t *testing.T) {
 // MaxConcurrency=1 时退避期间后续批次无法执行，与 WithMaxPending
 // 叠加即在退避窗口集中卸载（ErrOverloaded）。
 func TestRetryBackoffHoldsSlotAndShedsDuringWindow(t *testing.T) {
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	var attempts atomic.Int64
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
 		if attempts.Add(1) == 1 {
@@ -317,7 +317,7 @@ func TestRetryBackoffHoldsSlotAndShedsDuringWindow(t *testing.T) {
 		batcher.WithMaxConcurrency(1),
 		batcher.WithMaxPending(2),
 		batcher.WithRetry(2, func(attempt int) time.Duration { return 150 * time.Millisecond }),
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 	)
 
 	d1 := make(chan int, 1)
@@ -354,7 +354,7 @@ func TestRetryBackoffHoldsSlotAndShedsDuringWindow(t *testing.T) {
 	if err := b.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if v := m.counters["batcher_overloaded_total"].Value(); v != 1 {
+	if v := m.counterValue(t, "batcher_overloaded_total"); v != 1 {
 		t.Fatalf("batcher_overloaded_total = %v, want 1", v)
 	}
 }

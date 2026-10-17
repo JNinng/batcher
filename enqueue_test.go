@@ -15,7 +15,7 @@ import (
 // 约束：Enqueue 不阻塞等待结果——提交即返回，Item 与 Do 来源一视同仁
 // 地组批执行；准入额度计入并在交付后全量清算。
 func TestEnqueueSubmitsWithoutWaiting(t *testing.T) {
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	var mu sync.Mutex
 	var calls [][]string
 	fn := func(ctx context.Context, lines []string) ([]int, error) {
@@ -28,7 +28,7 @@ func TestEnqueueSubmitsWithoutWaiting(t *testing.T) {
 	b := batcher.New[string, int](fn,
 		batcher.WithMaxSize(10),
 		batcher.WithInterval(10*time.Second), // 只能靠 Close flush
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 	)
 
 	started := time.Now()
@@ -55,12 +55,12 @@ func TestEnqueueSubmitsWithoutWaiting(t *testing.T) {
 	if fmt.Sprint(got) != "[a b c]" {
 		t.Fatalf("batch = %v, want [a b c]", got)
 	}
-	if v := m.gauges["batcher_queue_depth"].Value(); v != 0 {
+	if v := m.gaugeValue(t, "batcher_queue_depth"); v != 0 {
 		t.Fatalf("queue_depth = %v, want 0（Enqueue 计入准入并全量清算）", v)
 	}
 	// wait_seconds 对 Enqueue 条目同样计费：每条一次（入队 → 下游写出）。
-	if vs := m.histogram["batcher_wait_seconds"].Values(); len(vs) != 3 {
-		t.Fatalf("wait_seconds = %d 次, want 3（Enqueue 条目同口径计费）", len(vs))
+	if c := m.histogram(t, "batcher_wait_seconds").Count; c != 3 {
+		t.Fatalf("wait_seconds = %d 次, want 3（Enqueue 条目同口径计费）", c)
 	}
 	// Close 后新提交必得 ErrClosed（确定性路径）。
 	if err := b.Enqueue(context.Background(), "x"); !errors.Is(err, batcher.ErrClosed) {
@@ -201,7 +201,7 @@ func TestEnqueueFuncCallbackPanicRecovered(t *testing.T) {
 // 约束：WithMaxPending 对 Enqueue 一视同仁——额度满员即卸载拒绝，
 // 且与 Do 同口径计入 batcher_overloaded_total。
 func TestEnqueueShedsWhenFull(t *testing.T) {
-	m := newFakeMeter()
+	m := newTestMeter(t)
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
 	fn := func(ctx context.Context, reqs []int) ([]int, error) {
@@ -214,7 +214,7 @@ func TestEnqueueShedsWhenFull(t *testing.T) {
 		batcher.WithMaxSize(1),
 		batcher.WithInterval(10*time.Millisecond),
 		batcher.WithMaxPending(1),
-		batcher.WithMeter(m),
+		batcher.WithMeter(m.meter),
 	)
 
 	d1 := make(chan int, 1)
@@ -230,7 +230,7 @@ func TestEnqueueShedsWhenFull(t *testing.T) {
 	if err := b.Enqueue(context.Background(), 2); !errors.Is(err, batcher.ErrOverloaded) {
 		t.Fatalf("Enqueue(2) = %v, want ErrOverloaded", err)
 	}
-	if v := m.counters["batcher_overloaded_total"].Value(); v != 1 {
+	if v := m.counterValue(t, "batcher_overloaded_total"); v != 1 {
 		t.Fatalf("batcher_overloaded_total = %v, want 1（Enqueue 卸载同口径计费）", v)
 	}
 

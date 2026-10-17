@@ -41,8 +41,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/jninng/observ"
 )
 
 // BatchFunc 是用户提供的批量执行函数：接收整个 Batch（恒非空），
@@ -133,8 +131,8 @@ type Batcher[Req, Res any] struct {
 	baseCancel context.CancelFunc
 
 	observer Observer
-	metrics  *metrics // meter 为 Noop 时为 nil，整体跳过埋点
-	logger   observ.Logger
+	metrics  *metrics // meter 未注入时为 nil，整体跳过埋点
+	logger   *slog.Logger
 
 	// admitted 记已准入未交付的提交数（准入口径，queue_depth 数据源）：
 	// 提交入口原子加一，拒绝或中途退路（closing / ctx.Done）即回滚，
@@ -226,11 +224,8 @@ func newBatcher[Req, Res any](fn BatchFunc[Req, Res], fold foldFunc[Req, Res], o
 	if cfg.observer == nil {
 		cfg.observer = NoopObserver
 	}
-	if cfg.meter == nil {
-		cfg.meter = observ.NoopMeter
-	}
 	if cfg.logger == nil {
-		cfg.logger = observ.DefaultLogger() // 构造期快照语义
+		cfg.logger = silentLogger // 构造期快照语义：默认静默，零输出
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -255,17 +250,21 @@ func newBatcher[Req, Res any](fn BatchFunc[Req, Res], fold foldFunc[Req, Res], o
 		observer:       cfg.observer,
 		logger:         cfg.logger,
 	}
-	if cfg.meter != observ.NoopMeter { // NoopMeter 可比较，整体门控
+	if cfg.meter != nil { // 未注入即不埋点，指标句柄集保持 nil
 		b.metrics = newMetrics(cfg.meter)
 	}
 	go b.run()
 	b.emitCreated()
-	b.logger.Log(slog.LevelInfo, "batcher: created",
+	b.logger.InfoContext(context.Background(), "batcher: created",
 		slog.Int("max_size", cfg.maxSize),
 		slog.Duration("interval", cfg.interval),
 	)
 	return b
 }
+
+// silentLogger 是未注入 Logger 时的缺省落点：discard handler，
+// 零输出且内部自做级别门控（构造期一次固定，后续替换不追溯）。
+var silentLogger = slog.New(slog.DiscardHandler)
 
 // foldByKey 生成批内折叠器：位置表 pos 在折叠时一次算好，scatter 仅
 // 做下标回填、不再调 key 函数（回填发生在 callFn 的 recover 之外，
@@ -369,7 +368,7 @@ func (b *Batcher[Req, Res]) submit(ctx context.Context, req Req, cb func(res Res
 		return nil, ErrClosed
 	default:
 	}
-	if err := b.admit(); err != nil {
+	if err := b.admit(ctx); err != nil {
 		return nil, err
 	}
 	it := &item[Req, Res]{
@@ -397,12 +396,12 @@ func (b *Batcher[Req, Res]) submit(ctx context.Context, req Req, cb func(res Res
 // 上限的软性仅在于并发竞争下的计数瞬时虚高（其他提交的拒绝尚未
 // 回滚）：额度尚空的提交可能被假阳性提前拒绝，被拒调用方退避重试
 // 即可。Do / Enqueue / EnqueueFunc 均经 submit 走此路径，计数口径
-// 涵盖全部提交。
-func (b *Batcher[Req, Res]) admit() error {
+// 涵盖全部提交。ctx 为提交方 ctx，供卸载拒绝打点做 trace 关联。
+func (b *Batcher[Req, Res]) admit(ctx context.Context) error {
 	if n := b.admitted.Add(1); b.maxPending > 0 && n > int64(b.maxPending) {
 		b.admitted.Add(-1)
 		if b.metrics != nil {
-			b.metrics.overloadedTotal.Inc()
+			b.metrics.overloadedTotal.Add(ctx, 1)
 		}
 		return ErrOverloaded
 	}
@@ -426,7 +425,7 @@ func (b *Batcher[Req, Res]) Close(ctx context.Context) error {
 	case <-b.done:
 		return nil
 	case <-ctx.Done():
-		b.logger.Log(slog.LevelWarn, "batcher: close timed out, flush continues in background",
+		b.logger.WarnContext(ctx, "batcher: close timed out, flush continues in background",
 			slog.String("error", ctx.Err().Error()),
 		)
 		return ctx.Err()
@@ -443,7 +442,7 @@ func (b *Batcher[Req, Res]) run() {
 	defer b.baseCancel()
 	defer func() {
 		b.emitClosed()
-		b.logger.Log(slog.LevelInfo, "batcher: closed")
+		b.logger.InfoContext(context.Background(), "batcher: closed")
 		close(b.done)
 	}()
 	for {
@@ -619,7 +618,7 @@ func (b *Batcher[Req, Res]) execute(job batchJob[Req, Res]) {
 			}
 			retries++ // 计数在退避结算后：只记实际执行的重试，退避失败不计
 			if b.metrics != nil {
-				b.metrics.batchRetries.Inc()
+				b.metrics.batchRetries.Add(b.baseCtx, 1)
 			}
 			res, uniqueSize, pc, err = b.callBatch(reqs)
 		}
@@ -640,27 +639,27 @@ func (b *Batcher[Req, Res]) execute(job batchJob[Req, Res]) {
 			b.safeItemCallback(it.cb, r, err)
 		}
 		if b.metrics != nil {
-			b.metrics.waitSeconds.Observe(time.Since(it.arrivedAt).Seconds())
+			b.metrics.waitSeconds.Record(b.baseCtx, time.Since(it.arrivedAt).Seconds())
 		}
 		if it.waited && it.callerCtx.Err() != nil {
 			// Do 来源且交付时 caller ctx 已取消：结果无人读取的近似
 			// 信号（waiter 侧 resCh/ctx.Done 双就绪随机选择，个别结果
 			// 实际被读走）。仅旁路观测，不改交付语义。
 			if b.metrics != nil {
-				b.metrics.discardedItems.Inc()
+				b.metrics.discardedItems.Add(b.baseCtx, 1)
 			}
 			b.emitItemDiscarded(ItemDiscardedEvent{BatchSize: len(batch)})
 		}
 	}
 
 	if b.metrics != nil {
-		b.metrics.batchTotal.Inc()
-		b.metrics.batchSize.Observe(float64(len(batch)))
-		b.metrics.durationSeconds.Observe(durationSeconds)
+		b.metrics.batchTotal.Add(b.baseCtx, 1)
+		b.metrics.batchSize.Record(b.baseCtx, float64(len(batch)))
+		b.metrics.durationSeconds.Record(b.baseCtx, durationSeconds)
 		if err != nil {
-			b.metrics.batchFailed.Inc()
+			b.metrics.batchFailed.Add(b.baseCtx, 1)
 		}
-		b.metrics.queueDepth.Set(float64(b.admitted.Load()))
+		b.metrics.queueDepth.Record(b.baseCtx, b.admitted.Load())
 	}
 	b.emitFlushed(BatchFlushedEvent{
 		Size:            len(batch),

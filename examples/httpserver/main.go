@@ -201,7 +201,7 @@ func serve(mux *http.ServeMux) string {
 	return ln.Addr().String()
 }
 
-// printObserver 演示 observ 风格的类型化旁路观测。
+// printObserver 演示类型化旁路观测的接入。
 type printObserver struct{}
 
 func (printObserver) OnCreated(e batcher.CreatedEvent) {

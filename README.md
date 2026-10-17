@@ -18,7 +18,7 @@
 - **批次重试**：`WithRetry(n, backoff)` 对批次函数以 `ErrRetryable` 哨兵标记的瞬时故障整批按原请求重执行（含退避，持槽进行），至多 n 次；其他错误照常广播——不重试的默认语义不变。
 - **取消不改变批次形状**：调用方取消仅解除自身等待，其 Item 保留照常执行、结果丢弃；批次的 size 与对位绝不因取消而变化。
 - **优雅关闭**：`Close` 立即 flush 未满批并等待在途批次完成，正常返回即全部已入队 Waiter 已被唤醒；幂等、可并发调用。
-- **旁路可观测**：类型化 `Observer` 事件覆盖批次生命周期（进入执行、批完成含触发条件/批序号/panic 现场、条目丢弃、关闭）、`observ.Meter` 指标、结构化日志；Observer 与 Meter 默认 Noop，日志未注入时构造期快照 `observ.DefaultLogger()`。
+- **旁路可观测**：类型化 `Observer` 事件覆盖批次生命周期（进入执行、批完成含触发条件/批序号/panic 现场、条目丢弃、关闭）、OTel `metric.Meter` 指标、`*slog.Logger` 结构化日志；Observer 默认 Noop，未注入 Meter 不埋点，日志未注入时构造期固定 discard logger（默认静默）。
 
 ## 安装
 
@@ -104,8 +104,8 @@ go run ./examples/sharded
 | `WithMaxBytes(n, size)` | 批字节上限（Flush 触发条件之三，与条数/时间并列先到先触发），`size func(Req) int` 由你声明条目字节量；按原始条目累计（keyed 批的重复照常计费），单条超限自成孤批。n 必须 > 0，size 的 Req 须与 Batcher 一致，失配构造期 panic；size panic 或返回负数 → 该批整体失败（不调批次函数）。 |
 | `WithRetry(n, backoff)` | 批次级重试：仅 `ErrRetryable` 哨兵错误按原批次重执行至多 n 次（含退避，持槽进行）；其他错误照常广播。backoff panic 或负数返回 → 该批失败；n 为负、n > 0 缺 backoff、n = 0 携带 backoff → 构造期 panic（n = 0 即默认不重试）。 |
 | `WithObserver(o)` | 注入 `Observer` 旁路观测，默认 `NoopObserver`。 |
-| `WithMeter(m)` | 注入 `observ.Meter` 指标，默认 Noop。 |
-| `WithLogger(l)` | 注入 `observ.Logger` 日志，未注入时构造期快照默认 Logger。 |
+| `WithMeter(m)` | 注入 OTel `metric.Meter` 指标，未注入不埋点；仪表自构造时刻绑定 m 所属 provider。 |
+| `WithLogger(l)` | 注入 `*slog.Logger` 日志，未注入时构造期固定 discard logger（默认静默）。 |
 
 `fn` 或 key 函数为 nil、必填选项缺失或非正、`MaxPending` 为负、`MaxConcurrency` 为负、`MaxRetry` 非法（为负、>0 缺其 backoff 或 =0 携带 backoff）、`MaxBytes` 为负或其 size 函数缺失/与 Req 失配属程序员工错，构造期 panic（`New` / `NewKeyed` / `NewKeyedMap`）。
 
@@ -125,7 +125,7 @@ type Observer interface {
 
 `OnFlushStart` 与 `OnBatchFlushed` 以批序号 `Seq`（Batcher 内自 1 单调递增，跨 Batcher 不唯一）恒成对，每批恰一对——n>1 交错回调下靠 Seq 配对；`Trigger` 报告 Flush 触发条件（`size` / `bytes` / `interval` / `close`，Close 路径含组批中途截断的批）；`Panic` / `Stack` 仅批次函数 panic 降级的批非 nil（recover 原值与 recover 点调用栈，key / size / backoff 函数的 panic 只保留 Err 信息）；`OnItemDiscarded` 是近似信号——口径为「交付时 caller ctx 已取消」，个别被判丢弃的结果在 waiter 侧 select 双就绪时实际被读走，fire-and-forget 来源不触发。
 
-**指标**（注入 `observ.Meter` 后启用，命名遵循 `_total` / `_seconds` / `_depth` 约定；Meter 实现不得 panic（库不做 recover）且必须并发安全——`WithMaxConcurrency(n>1)` 或路由层分片下埋点从多个 goroutine 并发发生）：
+**指标**（注入 OTel `metric.Meter` 后启用，命名遵循 `_total` / `_seconds` / `_depth` 约定；Meter 实现不得 panic（库不做 recover）且必须并发安全——`WithMaxConcurrency(n>1)` 或路由层分片下埋点从多个 goroutine 并发发生）：
 
 | 指标 | 类型 | 含义 |
 | --- | --- | --- |
